@@ -1,0 +1,1405 @@
+<pre class='metadata'>
+Title: Fetch Server API
+Shortname: fetch-server
+Group: wintertc
+Status: DRAFT
+URL: https://fetch-server.proposal.wintertc.org/
+Repository: https://github.com/jasnell/fetch-server
+Editor: James M Snell, Cloudflare https://cloudflare.com/, jsnell@cloudflare.com
+Markup Shorthands: markdown yes
+No Abstract: yes
+</pre>
+<pre class=link-defaults>
+spec:fetch; type:interface; text:Request
+spec:fetch; type:interface; text:Response
+spec:fetch; type:interface; text:Headers
+spec:fetch; type:typedef; text:HeadersInit
+spec:fetch; type:dictionary; text:ResponseInit
+
+spec:dom; type:interface; text:AbortSignal
+spec:dom; type:interface; text:AbortController
+spec:dom; type:interface; text:DOMException
+
+spec:streams; type:interface; text:ReadableStream
+spec:streams; type:interface; text:WritableStream
+
+spec:html; type:interface; text:WebSocket
+
+spec:dom; type:dfn; for:AbortSignal; text:aborted
+spec:dom; type:dfn; text:aborted flag
+spec:dom; type:dfn; text:signal abort
+</pre>
+
+<h2 class="no-num" id="intro">Introduction</h2>
+
+<div class="note">
+This document is a <strong>proposal</strong> to ECMA TC55 (WinterTC). It has not been adopted as a standard and may change substantially based on committee feedback. It is published for review and discussion purposes.
+</div>
+
+The [Fetch Standard](https://fetch.spec.whatwg.org/) defined {{Request}}, {{Response}}, {{Headers}}, and `fetch()` for browser HTTP clients. Server-side runtimes adopted these types but diverged on everything around them.
+
+This specification defines a server-side API that:
+
+*   Uses standard {{Request}} and {{Response}} without modification.
+*   Introduces a {{ServerContext}} for connection metadata, server capabilities, and lifecycle — the things that belong to the processing environment, not the HTTP message.
+*   Unifies HTTP/1.1, HTTP/2, and HTTP/3 behind one programming model.
+*   Handles both request/response exchanges and tunnel protocols (extended CONNECT).
+*   Defines primitives for the Capsule Protocol and HTTP Datagrams.
+
+### Goals ### {#goals}
+
+1.  **One server-side programming model for all HTTP versions**: A handler should not need to know whether a request arrived over HTTP/1.1, HTTP/2, or HTTP/3. Protocol-version-specific behavior is the implementation's concern, not the application's.
+
+2.  **Standard Fetch types without extension**: The {{Request}} a handler receives is a {{Request}}. The {{Response}} a handler returns is a {{Response}}. No duck-typing, no structural compatibility concerns, no server-specific subtypes that almost-but-not-quite match the standard types.
+
+3.  **Clean separation of message and environment**: The HTTP message ({{Request}}) is separate from the server processing environment ({{ServerContext}}). Connection metadata, lifecycle management, and server capabilities are properties of the context, not the request.
+
+4.  **Incremental adoption**: A handler that ignores the context and uses only {{Request}} and {{Response}} works unchanged. Server-specific capabilities are available when needed but never required.
+
+5.  **Portability across runtimes**: The same handler code should run on any conforming runtime without per-runtime adapters.
+
+6.  **Extensibility for future protocols**: Extended CONNECT is designed to carry new protocols. The handler model accommodates new `:protocol` values without API changes and allows for entirely new handlers to be defined.
+
+### Non-Goals ### {#non-goals}
+
+1.  **Routing**: This specification does not define a router, URL pattern matching, or request dispatch. Routing is an application or framework concern.
+
+2.  **Middleware**: This specification does not define a middleware pipeline, plugin system, or request/response transformation chain.
+
+3.  **Response helpers**: This specification does not define convenience methods for building responses (no `ctx.json()`, `ctx.html()`, etc.). Handlers return a standard {{Response}}.
+
+4.  **Replacing existing APIs**: This does not replace `node:http`, `node:http2`, `Deno.serve()`, `Bun.serve()`, or any existing API. Existing APIs continue to work.
+
+5.  **Browser implementation**: This specification targets server-side runtimes.
+
+### Relationship to Existing Specifications ### {#related-specs}
+
+*   [Fetch Standard](https://fetch.spec.whatwg.org/): This specification depends on the {{Request}}, {{Response}}, {{Headers}}, and body definitions from Fetch. It assumes that {{Request}} and {{Response}} support trailers (`Promise<Headers>` `.trailers` property, `trailers` constructor option) and that `fetch()` supports an `onInformation` callback for receiving informational responses on the client side.
+*   [Streams Standard](https://streams.spec.whatwg.org/): {{ReadableStream}} and {{WritableStream}} are used for bodies, tunnel data, capsules, and datagrams.
+*   [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110): HTTP semantics, including trailer fields and informational responses.
+*   [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218): Extensible Prioritization Scheme for HTTP.
+*   [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297): HTTP Datagrams and the Capsule Protocol.
+*   [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221): Unreliable Datagram Extension to QUIC.
+*   [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441) / [RFC 9220](https://www.rfc-editor.org/rfc/rfc9220): WebSocket bootstrapping via extended CONNECT over HTTP/2 and HTTP/3.
+*   [RFC 9298](https://www.rfc-editor.org/rfc/rfc9298): Proxying UDP in HTTP.
+*   [RFC 9484](https://www.rfc-editor.org/rfc/rfc9484): Proxying IP in HTTP.
+*   [RFC 9651](https://www.rfc-editor.org/rfc/rfc9651): Structured Field Values for HTTP.
+
+### Design Rationale ### {#design-rationale}
+
+#### Why a context object? #### {#why-context}
+
+The properties needed on the server side fall into distinct categories:
+
+<table>
+  <thead>
+    <tr><th>Category</th><th>Examples</th><th>Belongs to...</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>The HTTP message</td><td>method, url, headers, body</td><td>The {{Request}}</td></tr>
+    <tr><td>Connection metadata</td><td>remote address, ALPN protocol</td><td>The connection</td></tr>
+    <tr><td>Server capabilities</td><td>informational responses</td><td>The response pipeline</td></tr>
+    <tr><td>Execution lifecycle</td><td>waitUntil</td><td>The runtime environment</td></tr>
+  </tbody>
+</table>
+
+None of these are properties of the HTTP message itself. Putting them on {{Request}} conflates the message with its processing environment. A context object keeps them separate.
+
+Runtimes have independently arrived at similar patterns:
+
+*   Cloudflare Workers: `fetch(request, env, ctx)` — three positional arguments, where `ctx` provides `waitUntil()`.
+*   Deno: `Deno.serve((request, info) => ...)` — two arguments, where `info` provides `remoteAddr` and `completed`.
+*   Hono: `(c) => ...` — a context object with `c.req` for the request.
+
+A single context object avoids positional fragility and extends without signature changes.
+
+#### Why not extend Request and Response? #### {#why-not-extend}
+
+Subtyping (`ServerRequest extends Request`) creates structural compatibility questions: which client-specific {{Request}} properties (`.cache`, `.credentials`, `.mode`, `.redirect`, `.destination`) should a server-side subtype expose, and with what values? These properties are meaningless for incoming server requests.
+
+Duck-typing (a `ServerRequest` that replicates {{Request}}'s interface) adds `instanceof` and type identity problems on top.
+
+Using a standard {{Request}} avoids both. `ctx.request instanceof Request` is `true`. Proxying is `return fetch(ctx.request)`.
+
+<h2 class="no-num" id="copyright">Copyright</h2>
+
+*&copy; 2026 Ecma International*
+
+*Permission under Ecma's copyright to copy, modify, prepare derivative works of, and distribute this work, with or without modification, for any purpose and without fee or royalty is hereby granted, provided that you include the full text of this copyright notice on ALL copies of the work or portions thereof.*
+
+*THIS WORK IS PROVIDED "AS IS," AND COPYRIGHT HOLDERS MAKE NO REPRESENTATIONS OR WARRANTIES, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO, WARRANTIES OF MERCHANTABILITY OR FITNESS FOR ANY PARTICULAR PURPOSE OR THAT THE USE OF THE DOCUMENT WILL NOT INFRINGE ANY THIRD PARTY PATENTS, COPYRIGHTS, TRADEMARKS OR OTHER RIGHTS.*
+
+Scope {#scope}
+==============
+
+This proposal defines the [=Fetch Server API=], a server-side HTTP API built on the Fetch Standard's {{Request}} and {{Response}} types. It specifies:
+
+*   A {{ServerContext}} interface providing connection metadata, server capabilities, and lifecycle management for incoming HTTP requests.
+*   A {{ConnectContext}} interface extending {{ServerContext}} for CONNECT and extended CONNECT tunnel protocols.
+*   A {{Tunnel}} interface for bidirectional communication over established HTTP tunnels, including the Capsule Protocol and HTTP Datagrams.
+*   A {{WebTransportSession}} interface for multiplexed streams and datagrams over HTTP connections.
+*   A handler object model with `fetch()` and `connect()` methods for processing requests and tunnels.
+*   An optional infrastructure layer providing `serve()`, {{Server}}, {{Listener}}, and lifecycle management.
+
+Conformance {#conformance}
+==========================
+
+This specification has two layers:
+
+**Core** (handler model): The {{ServerContext}}, {{ConnectContext}}, handler object pattern, and the handler callback signatures. A conforming implementation MUST support this layer.
+
+**Infrastructure** (server lifecycle): The `serve()` function, {{Server}}, {{Listener}}, {{Closeable}}, {{ListenOptions}}, {{ServerOptions}}, and {{TLSOptions}}. An implementation MAY support this layer. An implementation that manages server lifecycle externally (e.g., an edge runtime where binding, TLS, and connection management are handled by the platform outside the application) is not required to expose `serve()`, {{Server}}, or {{Listener}}. Such an implementation is conforming as long as it implements the core layer.
+
+<div class="note">
+Cloudflare Workers is an example of a runtime that would implement the core layer but not the infrastructure layer. The application exports a handler object; the platform handles everything else. Node.js and Deno are examples of runtimes that would implement both layers.
+</div>
+
+A conforming implementation shall also conform to [[!ECMASCRIPT]] and [[!WEBIDL]].
+
+Support for the following features is OPTIONAL at both layers. An implementation that does not support an optional feature MUST still expose the relevant interface members and behave as specified for the unsupported case:
+
+*   Priority
+*   Informational responses
+*   Denial with error codes
+*   Extended CONNECT and tunnel protocols
+*   WebTransport
+*   HTTP Datagrams
+*   HTTP/3 and QUIC
+
+Normative references {#normative-references}
+=============================================
+
+The following documents are referred to in the text in such a way that some or all of their content constitutes requirements of this document.
+
+<div data-fill-with="references"></div>
+
+Terms and definitions {#terminology}
+====================================
+
+For the purposes of this document, the terms and definitions given in [[ECMASCRIPT]], the Fetch Standard [[FETCH]], the DOM Standard [[DOM]], and the following apply.
+
+<h3 class="no-toc" id="term-fetch-server-api"><dfn>Fetch Server API</dfn></h3>
+
+the server-side HTTP API defined by this specification
+
+<h3 class="no-toc" id="term-web-interoperable-runtime"><dfn>web-interoperable runtime</dfn></h3>
+
+ECMAScript-based runtime environment as defined by WinterTC
+
+<h3 class="no-toc" id="term-server"><dfn>server</dfn></h3>
+
+an entity that accepts HTTP connections, receives requests, and sends responses
+
+<h3 class="no-toc" id="term-handler"><dfn>handler</dfn></h3>
+
+a JavaScript function provided by the application that processes incoming requests or tunnel establishment attempts
+
+<h3 class="no-toc" id="term-tunnel"><dfn>tunnel</dfn></h3>
+
+a long-lived bidirectional communication channel established through an HTTP connection via the CONNECT method or extended CONNECT
+
+<h3 class="no-toc" id="term-connect-protocol"><dfn>connect protocol</dfn></h3>
+
+the value of the `:protocol` pseudo-header in an extended CONNECT request, identifying the protocol being tunneled (e.g., `"websocket"`, `"webtransport"`, `"connect-udp"`, `"connect-ip"`)
+
+<h3 class="no-toc" id="term-protocol-marker"><dfn>protocol marker</dfn></h3>
+
+a `Symbol.for('server.protocol')` property on a [=handler=] object with an integer version value, used by the runtime to distinguish this API from legacy invocation conventions
+
+
+Web IDL definitions {#idl}
+==========================
+
+SocketAddress {#idl-socketaddress}
+----------------------------------
+
+<pre class="idl">
+dictionary SocketAddress {
+  DOMString address;
+  unsigned short port;
+  DOMString family;
+};
+</pre>
+
+A {{SocketAddress}} represents a network endpoint. The {{SocketAddress/address}} member is the IP address as a string. The {{SocketAddress/family}} member indicates the address family: `"IPv4"` or `"IPv6"`.
+
+RequestPriority {#idl-requestpriority}
+--------------------------------------
+
+<pre class="idl">
+dictionary RequestPriority {
+  unsigned short urgency = 3;
+  boolean incremental = false;
+};
+</pre>
+
+A {{RequestPriority}} represents a priority signal per [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218). The {{RequestPriority/urgency}} member is an integer in the range 0&ndash;7, where 0 is the highest priority and 7 is the lowest. The default is 3. The {{RequestPriority/incremental}} member indicates whether incremental delivery is preferred.
+
+Callback definitions {#idl-callbacks}
+-------------------------------------
+
+<pre class="idl">
+callback PriorityCallback = undefined (RequestPriority priority);
+
+callback FetchHandler = (Response or undefined or
+                         Promise&lt;Response or undefined>)
+                        (ServerContext ctx);
+
+callback ConnectHandler = (Response or undefined or
+                           Promise&lt;Response or undefined>)
+                          (ConnectContext ctx);
+</pre>
+
+The {{FetchHandler}} callback receives a {{ServerContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one.
+
+The {{ConnectHandler}} callback receives a {{ConnectContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one.
+
+Options dictionaries {#idl-options}
+-----------------------------------
+
+<pre class="idl">
+dictionary WebSocketUpgradeInit {
+  sequence&lt;DOMString> protocol;
+};
+
+dictionary WebTransportCloseInfo {
+  unsigned long closeCode = 0;
+  USVString reason = "";
+};
+
+dictionary TLSCertificate {
+  (DOMString or BufferSource) cert;
+  (DOMString or BufferSource) key;
+};
+
+callback SNICallback = (TLSCertificate or Promise&lt;TLSCertificate> or null)
+                       (DOMString hostname);
+
+dictionary TLSOptions : TLSCertificate {
+  sequence&lt;DOMString> alpn;
+  (SNICallback or record&lt;DOMString, TLSCertificate>) sni;
+};
+
+dictionary QUICOptions {
+};
+
+dictionary ServerOptions {
+  unsigned short port;
+  DOMString hostname;
+  TLSOptions tls;
+  (boolean or QUICOptions) quic = false;
+  AbortSignal signal;
+};
+
+dictionary ListenOptions {
+  unsigned short port = 0;
+  DOMString hostname = "0.0.0.0";
+  TLSOptions tls;
+  (boolean or QUICOptions) quic;
+};
+
+dictionary HandlerObject {
+  FetchHandler fetch;
+  ConnectHandler connect;
+};
+</pre>
+
+The ServerContext interface {#idl-servercontext}
+------------------------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface ServerContext {
+  [SameObject] readonly attribute Request request;
+
+  readonly attribute SocketAddress remoteAddress;
+  readonly attribute DOMString alpnProtocol;
+
+  readonly attribute RequestPriority clientPriority;
+  attribute RequestPriority? serverPriority;
+  undefined onPriority(PriorityCallback callback);
+
+  undefined sendInformational(unsigned short status,
+                              optional HeadersInit headers);
+
+  undefined deny(optional any error);
+
+  undefined waitUntil(Promise&lt;any> promise);
+};
+</pre>
+
+The {{ServerContext}} interface is the server-side processing environment for an incoming HTTP request. It provides the {{Request}}, connection metadata, server capabilities, and lifecycle management.
+
+The ConnectContext interface {#idl-connectcontext}
+--------------------------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface ConnectContext : ServerContext {
+  readonly attribute DOMString? connectProtocol;
+
+  Promise&lt;Tunnel> accept(optional ResponseInit init = {});
+
+  WebSocket upgradeWebSocket(optional WebSocketUpgradeInit options = {});
+  Promise&lt;WebTransportSession> upgradeWebTransport();
+};
+</pre>
+
+The {{ConnectContext}} interface is the server-side processing environment for an incoming CONNECT or extended CONNECT request. It extends {{ServerContext}} with protocol identification and tunnel establishment capabilities.
+
+The Tunnel interface {#idl-tunnel}
+----------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface Tunnel {
+  readonly attribute ReadableStream readable;
+  readonly attribute WritableStream writable;
+
+  CapsuleStream capsules();
+
+  DatagramStream datagrams();
+
+  undefined close();
+  readonly attribute Promise&lt;undefined> closed;
+};
+</pre>
+
+The {{Tunnel}} interface represents an established [=tunnel=] through an HTTP connection.
+
+The CapsuleStream interface {#idl-capsulestream}
+-------------------------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface CapsuleStream {
+  readonly attribute ReadableStream readable;
+  readonly attribute WritableStream writable;
+};
+</pre>
+
+The {{CapsuleStream}} interface provides typed access to the Capsule Protocol on the CONNECT data stream. The {{CapsuleStream/readable}} attribute yields {{Capsule}} objects. The {{CapsuleStream/writable}} attribute accepts {{Capsule}} objects.
+
+The Capsule dictionary {#idl-capsule}
+-------------------------------------
+
+<pre class="idl">
+dictionary Capsule {
+  unsigned long long type;
+  Uint8Array data;
+};
+</pre>
+
+A {{Capsule}} represents a single typed capsule as defined in [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297).
+
+The DatagramStream interface {#idl-datagramstream}
+--------------------------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface DatagramStream {
+  readonly attribute ReadableStream readable;
+  readonly attribute WritableStream writable;
+  readonly attribute boolean unreliable;
+};
+</pre>
+
+The {{DatagramStream}} interface provides access to HTTP Datagrams associated with a [=tunnel=] or {{WebTransportSession}}. The {{DatagramStream/readable}} attribute yields {{Uint8Array}} payloads. The {{DatagramStream/writable}} attribute accepts {{Uint8Array}} payloads. The {{DatagramStream/unreliable}} attribute indicates whether datagrams are sent as unreliable QUIC DATAGRAM frames (`true`) or as reliable DATAGRAM capsules (`false`).
+
+The WebTransportSession interface {#idl-webtransportsession}
+------------------------------------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface WebTransportSession {
+  readonly attribute ReadableStream incomingBidirectionalStreams;
+  readonly attribute ReadableStream incomingUnidirectionalStreams;
+  Promise&lt;WebTransportBidirectionalStream> createBidirectionalStream();
+  Promise&lt;WritableStream> createUnidirectionalStream();
+
+  readonly attribute DatagramStream datagrams;
+
+  readonly attribute DOMString transport;
+
+  undefined close(optional WebTransportCloseInfo closeInfo = {});
+  readonly attribute Promise&lt;WebTransportCloseInfo> closed;
+  readonly attribute Promise&lt;undefined> ready;
+};
+</pre>
+
+The {{WebTransportSession}} interface represents an established WebTransport session, providing multiplexed streams and datagrams over an HTTP connection.
+
+The WebTransportBidirectionalStream interface {#idl-webtransportbidirectionalstream}
+------------------------------------------------------------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface WebTransportBidirectionalStream {
+  readonly attribute ReadableStream readable;
+  readonly attribute WritableStream writable;
+};
+</pre>
+
+The Closeable interface mixin {#idl-closeable}
+----------------------------------------------
+
+<pre class="idl">
+interface mixin Closeable {
+  attribute boolean busy;
+  Promise&lt;undefined> close();
+  undefined destroy(optional any error);
+  readonly attribute Promise&lt;undefined> closed;
+};
+</pre>
+
+The {{Closeable}} mixin provides a uniform lifecycle interface shared by {{Server}} and {{Listener}}. Implementations of {{Closeable}} should support `Symbol.asyncDispose`, which calls {{Closeable/close()}} and waits for the {{Closeable/closed}} promise.
+
+The Listener interface {#idl-listener}
+--------------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface Listener {
+  readonly attribute SocketAddress address;
+};
+Listener includes Closeable;
+</pre>
+
+The {{Listener}} interface represents a single network binding. The {{Listener/address}} attribute returns the {{SocketAddress}} that this listener is bound to.
+
+The Server interface {#idl-server}
+----------------------------------
+
+<pre class="idl">
+[Exposed=*]
+interface Server {
+  Promise&lt;Listener> listen(ListenOptions options);
+  iterable&lt;Listener>;
+};
+Server includes Closeable;
+</pre>
+
+The {{Server}} interface manages one or more listeners and dispatches incoming requests to handlers.
+
+The serve() function {#idl-serve}
+---------------------------------
+
+<pre class="idl">
+[Exposed=*]
+namespace FetchServer {
+  Server serve(HandlerObject handler, optional ServerOptions options = {});
+};
+</pre>
+
+<div class="note">
+The namespace `FetchServer` is used here for specification purposes. The actual module specifier is implementation-defined. Possible values include `"http"`, `"node:http"`, `"node:serve"`, or a WinterTC-standardized module name. The import surface is an open question; see [[#open-module-specifier]].
+</div>
+
+
+ServerContext {#servercontext}
+==============================
+
+The request {#servercontext-request}
+------------------------------------
+
+<div algorithm>
+The <dfn attribute for="ServerContext">request</dfn> attribute returns a standard {{Request}} as defined in the Fetch Standard.
+
+The {{Request}} is constructed by the implementation from the incoming HTTP message. It has:
+
+*   `method`: The HTTP method.
+*   `url`: The full request URL, reconstructed from the request target, `Host` header, and connection properties (scheme, port).
+*   `headers`: The request header fields.
+*   `body`: The request body as a {{ReadableStream}}, or `null`.
+*   `signal`: An {{AbortSignal}} that is aborted if the client disconnects or the connection is lost.
+*   `trailers`: A `Promise<Headers>` that resolves to the trailing header fields after the body is consumed.
+</div>
+
+Because `ctx.request` is a standard {{Request}}, it can be passed directly to client-side `fetch()` for proxying:
+
+```js
+async fetch(ctx) {
+  return fetch(ctx.request);
+}
+```
+
+Connection metadata {#servercontext-connection}
+------------------------------------------------
+
+<div algorithm>
+The <dfn attribute for="ServerContext">remoteAddress</dfn> attribute returns the {{SocketAddress}} of the remote peer. If the remote address is not available (e.g., the runtime abstracts it away), the implementation MAY return a {{SocketAddress}} with empty {{SocketAddress/address}} and `0` {{SocketAddress/port}}.
+</div>
+
+<div algorithm>
+The <dfn attribute for="ServerContext">alpnProtocol</dfn> attribute returns the ALPN protocol identifier negotiated for this connection. Common values are `"http/1.1"`, `"h2"`, and `"h3"`. If ALPN was not negotiated (e.g., plaintext HTTP/1.1), the value is `"http/1.1"`.
+</div>
+
+Note: The {{ServerContext/alpnProtocol}} value identifies the HTTP version of the connection. Handlers generally should not branch on this value. It is provided for logging, debugging, and the rare case where application behavior legitimately depends on the transport.
+
+Priority {#servercontext-priority}
+-----------------------------------
+
+[RFC 9218](https://www.rfc-editor.org/rfc/rfc9218) defines the Extensible Prioritization Scheme with {{RequestPriority/urgency}} (0&ndash;7, default 3) and {{RequestPriority/incremental}} (boolean, default false). Priority signals flow in two directions &mdash; client to server and server to implementation &mdash; represented by two properties:
+
+*   **{{ServerContext/clientPriority}}** (read-only) &mdash; what the client asked for.
+*   **{{ServerContext/serverPriority}}** (read/write) &mdash; what the server decided.
+
+### Client priority ### {#priority-client}
+
+<div algorithm>
+The <dfn attribute for="ServerContext">clientPriority</dfn> attribute returns the client's current priority signal, parsed from the `Priority` request header.
+
+The {{ServerContext/clientPriority}} getter is live: it always reflects the most recent client signal. When the client sends a PRIORITY_UPDATE frame (HTTP/2 or HTTP/3), the implementation updates the value returned by {{ServerContext/clientPriority}} before invoking any registered callback.
+
+If the request has no `Priority` header and no PRIORITY_UPDATE frame has been received, {{ServerContext/clientPriority}} returns the default values (`{ urgency: 3, incremental: false }`).
+</div>
+
+### Reprioritization ### {#priority-reprioritization}
+
+<div algorithm>
+The <dfn method for="ServerContext">onPriority(callback)</dfn> method registers a |callback| that is invoked when a PRIORITY_UPDATE frame is received for this request's stream. The |callback| receives a {{RequestPriority}} dictionary with the new values.
+
+PRIORITY_UPDATE frames are hop-by-hop (HTTP/2 and HTTP/3 only) and may arrive at any time during the request lifecycle. If no callback is registered, PRIORITY_UPDATE frames still update {{ServerContext/clientPriority}} &mdash; the handler is simply not notified synchronously.
+
+Only one callback may be registered. A subsequent call to {{ServerContext/onPriority()}} replaces the previous callback. Calling {{ServerContext/onPriority()}} with `null` removes the callback.
+
+For HTTP/1.1, where PRIORITY_UPDATE frames do not exist, the callback is never invoked. The initial priority from the `Priority` header (if present) is still available via {{ServerContext/clientPriority}}.
+</div>
+
+### Server priority ### {#priority-server}
+
+<div algorithm>
+The <dfn attribute for="ServerContext">serverPriority</dfn> attribute is a read/write property that overrides the server-internal scheduling priority for this response's delivery. It defaults to `null`, meaning "use the client's priority signal."
+
+When {{ServerContext/serverPriority}} is `null`, the implementation uses the client's priority signal ({{ServerContext/clientPriority}}) for scheduling. When {{ServerContext/serverPriority}} is set, the implementation uses the server's value instead, regardless of subsequent PRIORITY_UPDATE frames from the client. (The client's updates still appear in {{ServerContext/clientPriority}} and still trigger the {{ServerContext/onPriority()}} callback &mdash; the server simply overrides the scheduling decision.)
+</div>
+
+{{ServerContext/serverPriority}} is purely about server-internal scheduling. It does NOT set the `Priority` response header &mdash; that is for signaling priority preferences to intermediaries and is set directly on the {{Response}}:
+
+```js
+ctx.serverPriority = { urgency: 1 };   // internal scheduling
+return new Response(body, {
+  headers: { 'Priority': 'u=1' },      // signal to intermediaries
+});
+```
+
+These are intentionally separate concerns. A server may override internal scheduling without signaling intermediaries, or vice versa.
+
+Informational responses {#servercontext-informational}
+------------------------------------------------------
+
+<div algorithm>
+The <dfn method for="ServerContext">sendInformational(status, headers)</dfn> method sends an informational (1xx) response to the client.
+
+<ol>
+<li>If |status| is not in the range 100&ndash;199 inclusive, throw a {{RangeError}}.
+<li>Construct a headers object from |headers| if provided.
+<li>Send the informational response with status |status| and the constructed headers to the client.
+</ol>
+</div>
+
+Notable informational status codes:
+
+*   **100 Continue**: Indicates the server is willing to accept the request body. Typically sent automatically by the implementation when `Expect: 100-continue` is present, but may be sent explicitly.
+*   **103 Early Hints**: Provides header fields (typically `Link` headers) that the client can use to start preloading resources before the final response ([RFC 8297](https://www.rfc-editor.org/rfc/rfc8297)).
+
+An implementation that does not support informational responses accepts the method call without error and silently discards it.
+
+Note: The Fetch Standard's `onInformation` callback (in `fetch()` options) is the client-side counterpart: it receives informational responses. {{ServerContext/sendInformational()}} is the server-side counterpart: it sends them.
+
+Denial {#servercontext-denial}
+-------------------------------
+
+<div algorithm>
+The <dfn method for="ServerContext">deny(error)</dfn> method signals that the handler is declining to process the request. The request is not handled &mdash; no {{Response}} is generated. The handler returns `undefined` (or nothing) after calling {{ServerContext/deny()}}.
+
+At the protocol level, {{ServerContext/deny()}} resets the stream:
+
+*   HTTP/2: `RST_STREAM` with an error code
+*   HTTP/3: `RESET_STREAM` with an error code
+*   HTTP/1.1: Implementation-defined (close the connection, or send a 503 response and close as a pragmatic fallback)
+
+The optional |error| argument controls the protocol-level error code. If the error has a `.code` property, the implementation maps it to the appropriate protocol error code. The following abstract error codes are defined:
+</div>
+
+<table>
+  <thead>
+    <tr><th>Error code</th><th>Protocol signal</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><dfn>`ERR_HTTP_REQUEST_REJECTED`</dfn></td>
+      <td>REFUSED_STREAM (HTTP/2), H3_REQUEST_REJECTED (HTTP/3)</td>
+      <td>Not processed. Client may safely retry.</td>
+    </tr>
+    <tr>
+      <td><dfn>`ERR_HTTP_REQUEST_CANCELLED`</dfn></td>
+      <td>CANCEL (HTTP/2), H3_REQUEST_CANCELLED (HTTP/3)</td>
+      <td>Intentionally cancelled. May have been partially processed.</td>
+    </tr>
+    <tr>
+      <td><dfn>`ERR_HTTP_INTERNAL_ERROR`</dfn></td>
+      <td>INTERNAL_ERROR (HTTP/2), H3_INTERNAL_ERROR (HTTP/3)</td>
+      <td>Internal error in the server.</td>
+    </tr>
+    <tr>
+      <td><dfn>`ERR_HTTP_CONNECT_ERROR`</dfn></td>
+      <td>CONNECT_ERROR (HTTP/2), H3_CONNECT_ERROR (HTTP/3)</td>
+      <td>Tunnel-specific error.</td>
+    </tr>
+    <tr>
+      <td><dfn>`ERR_HTTP_GOAWAY`</dfn></td>
+      <td>GOAWAY frame (HTTP/2), GOAWAY frame (HTTP/3)</td>
+      <td>Close the connection after finishing in-flight streams.</td>
+    </tr>
+  </tbody>
+</table>
+
+When no |error| is provided, or when the error has no `.code` or an unrecognized `.code`, the implementation defaults to REFUSED_STREAM / H3_REQUEST_REJECTED. This is the correct default because {{ServerContext/deny()}} means the request was not processed, which is exactly the semantic REFUSED_STREAM was designed to express. A client receiving this signal knows the request can be safely retried &mdash; including non-idempotent methods like POST.
+
+The `ERR_HTTP_GOAWAY` code is a connection-level signal. Unlike the other codes which reset a single stream, `ERR_HTTP_GOAWAY` instructs the implementation to:
+
+1.  Refuse the current request (as with any {{ServerContext/deny()}} call).
+2.  Send a GOAWAY frame on the underlying connection, indicating that no new streams will be accepted.
+3.  Allow in-flight streams (requests already being processed by other handler invocations on the same connection) to complete normally.
+
+This provides a per-request escape hatch for connection-level concerns &mdash; rate limiting, credential revocation, or misbehavior detection &mdash; without exposing a connection object to the handler.
+
+For HTTP/1.1, `ERR_HTTP_GOAWAY` closes the connection after the current exchange. Since HTTP/1.1 connections are serial (ignoring pipelining), this is equivalent to closing the connection.
+
+Note: Proactive GOAWAY (shutting down connections without a triggering request) is handled by {{Closeable/close()}} and {{Closeable/destroy()}} in the infrastructure layer, not by {{ServerContext/deny()}}. The {{ServerContext/deny()}} mechanism covers the reactive case where a handler decides during request processing that the connection should be closed.
+
+Note: The error code mapping depends on the [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property), which adds a standardized `.code` property to the `Error` constructor options. If that proposal does not advance, the error code mechanism described here would need an alternative design &mdash; for instance, a dedicated options dictionary rather than an error object.
+
+Request lifecycle {#servercontext-lifecycle}
+--------------------------------------------
+
+<div algorithm>
+The <dfn method for="ServerContext">waitUntil(promise)</dfn> method extends the lifetime of the request processing beyond the return of the handler function. The [=server=] does not consider the request fully complete until all promises passed to {{ServerContext/waitUntil()}} have settled.
+</div>
+
+This is analogous to `ExtendableEvent.waitUntil()` in [Service Workers](https://w3c.github.io/ServiceWorker/) and `ctx.waitUntil()` in Cloudflare Workers.
+
+An implementation MAY impose an implementation-defined time limit on how long it will wait for outstanding {{ServerContext/waitUntil()}} promises to settle.
+
+
+ConnectContext {#connectcontext}
+================================
+
+Protocol identification {#connectcontext-protocol}
+---------------------------------------------------
+
+<div algorithm>
+The <dfn attribute for="ConnectContext">connectProtocol</dfn> attribute returns the value of the `:protocol` pseudo-header for extended CONNECT requests:
+
+*   `"websocket"` &mdash; WebSocket over HTTP/2 or HTTP/3
+*   `"webtransport"` &mdash; WebTransport session
+*   `"connect-udp"` &mdash; UDP proxying
+*   `"connect-ip"` &mdash; IP proxying
+*   Any other registered or private-use protocol identifier
+*   `null` &mdash; Plain CONNECT (no `:protocol` pseudo-header; TCP tunneling)
+</div>
+
+HTTP/1.1 upgrade normalization {#connectcontext-upgrade}
+---------------------------------------------------------
+
+HTTP/1.1 WebSocket connections use the `Upgrade: websocket` mechanism rather than extended CONNECT. To provide a unified handler model, an implementation normalizes HTTP/1.1 WebSocket upgrade requests into {{ConnectContext}} objects with {{ConnectContext/connectProtocol}} set to `"websocket"`.
+
+When an HTTP/1.1 request is received with `GET`, `Upgrade: websocket`, and `Connection: Upgrade`, the implementation constructs a {{ConnectContext}} with {{ConnectContext/connectProtocol}} set to `"websocket"` and the {{ServerContext/request}} preserving the original headers and URL.
+
+This normalization means WebSocket handling is in one place regardless of HTTP version.
+
+Accepting a tunnel {#connectcontext-accept}
+-------------------------------------------
+
+<div algorithm>
+The <dfn method for="ConnectContext">accept(init)</dfn> method accepts the CONNECT request and establishes a [=tunnel=]. It returns a `Promise<Tunnel>` that resolves when the tunnel is established.
+
+The optional |init| parameter allows setting response headers on the success response.
+</div>
+
+WebSocket upgrade {#connectcontext-websocket}
+---------------------------------------------
+
+<div algorithm>
+The <dfn method for="ConnectContext">upgradeWebSocket(options)</dfn> method is a convenience for WebSocket tunnel establishment. It performs the WebSocket-specific handshake (including subprotocol negotiation if |options|.{{WebSocketUpgradeInit/protocol}} is provided) and returns a standard {{WebSocket}} object already in the `OPEN` state.
+
+If {{ConnectContext/connectProtocol}} is not `"websocket"`, this method throws an `InvalidStateError` {{DOMException}}.
+</div>
+
+WebTransport upgrade {#connectcontext-webtransport}
+---------------------------------------------------
+
+<div algorithm>
+The <dfn method for="ConnectContext">upgradeWebTransport()</dfn> method establishes a WebTransport session. It returns a `Promise<WebTransportSession>` that resolves when the session is established.
+
+If {{ConnectContext/connectProtocol}} is not `"webtransport"`, this method throws an `InvalidStateError` {{DOMException}}.
+</div>
+
+Denying a tunnel {#connectcontext-deny}
+---------------------------------------
+
+A `connect()` handler can deny a tunnel in two ways:
+
+**Protocol-level denial** via {{ServerContext/deny()}} (inherited from {{ServerContext}}). This resets the stream without sending an HTTP response:
+
+```js
+async connect(ctx) {
+  ctx.deny();  // REFUSED_STREAM — client may retry
+  return;
+}
+```
+
+**Application-level denial** by returning a {{Response}}. This sends a standard HTTP error response:
+
+```js
+async connect(ctx) {
+  return new Response(null, { status: 403 });
+}
+```
+
+The choice depends on the intended signal: {{ServerContext/deny()}} says "I never processed this" (protocol-level); a {{Response}} says "I processed this and the answer is no" (application-level).
+
+
+Tunnel {#tunnel}
+================
+
+A {{Tunnel}} represents an established [=tunnel=] through an HTTP connection. It provides three layers of communication corresponding to the layers defined in the [Capsule Protocol](https://www.rfc-editor.org/rfc/rfc9297):
+
+1.  Raw data stream: Bidirectional byte stream on the CONNECT data channel.
+2.  Capsule Protocol: Typed TLV-framed messages for control signaling.
+3.  HTTP Datagrams: Discrete messages that may be unreliable on HTTP/3.
+
+Raw data stream {#tunnel-raw}
+-----------------------------
+
+The {{Tunnel/readable}} and {{Tunnel/writable}} attributes provide direct access to the CONNECT data stream as a {{ReadableStream}} and {{WritableStream}} of bytes.
+
+For a plain CONNECT tunnel (no `:protocol`), the raw data stream carries the tunneled TCP payload. For WebSocket, the raw data stream carries WebSocket frames.
+
+For protocols that use the Capsule Protocol, consuming the raw data stream directly and consuming capsules are mutually exclusive.
+
+Capsule Protocol {#tunnel-capsules}
+-----------------------------------
+
+<div algorithm>
+The <dfn method for="Tunnel">capsules()</dfn> method returns a {{CapsuleStream}} providing typed access to the Capsule Protocol on the CONNECT data stream. Calling {{Tunnel/capsules()}} consumes the raw data stream &mdash; subsequent access to {{Tunnel/readable}} or {{Tunnel/writable}} throws an `InvalidStateError` {{DOMException}}.
+</div>
+
+```js
+const { readable, writable } = tunnel.capsules();
+
+// Reading capsules
+for await (const capsule of readable) {
+  console.log(capsule.type, capsule.data);
+}
+
+// Writing capsules
+const writer = writable.getWriter();
+await writer.write({ type: 0xff37a2, data: new Uint8Array([...]) });
+```
+
+HTTP Datagrams {#tunnel-datagrams}
+----------------------------------
+
+<div algorithm>
+The <dfn method for="Tunnel">datagrams()</dfn> method returns a {{DatagramStream}} providing access to HTTP Datagrams associated with this [=tunnel=].
+
+On HTTP/3 connections where QUIC DATAGRAM frames are available, datagrams are sent and received as unreliable QUIC DATAGRAM frames. The {{DatagramStream/unreliable}} property is `true`.
+
+On HTTP/2 or HTTP/1.1 connections, datagrams are sent as DATAGRAM capsules (type `0x00`) on the data stream. The {{DatagramStream/unreliable}} property is `false`. Delivery is reliable (TCP guarantees it), but the API is the same.
+</div>
+
+Both [CONNECT-UDP](https://www.rfc-editor.org/rfc/rfc9298) and [CONNECT-IP](https://www.rfc-editor.org/rfc/rfc9484) use HTTP Datagrams for their data plane. The {{Tunnel/datagrams()}} API provides the foundation for both.
+
+
+WebTransport {#webtransport}
+============================
+
+WebTransport provides multiplexed streams and unreliable datagrams over an HTTP connection. On HTTP/3, it uses native QUIC streams and QUIC DATAGRAM frames. On HTTP/2, it falls back to the Capsule Protocol.
+
+Session establishment {#webtransport-session}
+---------------------------------------------
+
+A {{WebTransportSession}} is obtained via {{ConnectContext/upgradeWebTransport()}}:
+
+```js
+async connect(ctx) {
+  if (ctx.connectProtocol === 'webtransport') {
+    const session = await ctx.upgradeWebTransport();
+
+    // Accept incoming bidirectional streams
+    for await (const stream of session.incomingBidirectionalStreams) {
+      handleStream(stream);  // { readable, writable }
+    }
+  }
+}
+```
+
+Streams {#webtransport-streams}
+-------------------------------
+
+A {{WebTransportSession}} can carry multiple independent streams:
+
+*   Bidirectional streams: Opened by either side. Each has a {{WebTransportBidirectionalStream/readable}} and {{WebTransportBidirectionalStream/writable}}.
+*   Unidirectional streams: Opened by one side, read by the other.
+
+On HTTP/3, each WebTransport stream maps to a native QUIC stream. Streams are independent: a slow stream does not block others.
+
+On HTTP/2, streams are multiplexed over the single CONNECT data stream using the Capsule Protocol. Head-of-line blocking applies (TCP guarantees ordering).
+
+Datagrams {#webtransport-datagrams}
+-----------------------------------
+
+WebTransport datagrams follow the same {{DatagramStream}} interface as tunnel datagrams. The {{WebTransportSession/datagrams}} attribute provides a {{DatagramStream}}.
+
+Transport awareness {#webtransport-transport}
+---------------------------------------------
+
+The {{WebTransportSession/transport}} property indicates the underlying transport mechanism:
+
+*   `"quic"`: Native QUIC streams and QUIC DATAGRAM frames. No head-of-line blocking between streams. Datagrams are unreliable.
+*   `"capsule"`: Capsule Protocol over a single HTTP/2 data stream. Head-of-line blocking applies. Datagrams are reliable (sent as DATAGRAM capsules).
+
+
+Handler model {#handler-model}
+==============================
+
+An application provides one or two handler functions: `fetch()` for standard request/response exchanges, and optionally `connect()` for tunnel protocols.
+
+The FetchHandler {#handler-fetch}
+---------------------------------
+
+The `fetch()` [=handler=] receives a {{ServerContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one.
+
+Returning `undefined` is valid only after calling {{ServerContext/deny()}}. If the handler returns `undefined` without having called {{ServerContext/deny()}}, the implementation treats it as a programming error and sends a 500 Internal Server Error response.
+
+```js
+async fetch(ctx) {
+  const { request } = ctx;
+  const url = new URL(request.url);
+
+  // Deny under load
+  if (atCapacity) {
+    ctx.deny();
+    return;
+  }
+
+  if (url.pathname === '/api/data') {
+    return Response.json({ ok: true });
+  }
+
+  return new Response("Not Found", { status: 404 });
+}
+```
+
+The ConnectHandler {#handler-connect}
+-------------------------------------
+
+The `connect()` [=handler=] receives a {{ConnectContext}} and:
+
+*   Returns `undefined` if the tunnel has been accepted or denied via {{ServerContext/deny()}}.
+*   Returns a {{Response}} to deny the request at the application level.
+*   Throws or returns a rejected promise, causing a 502 Bad Gateway response.
+
+```js
+async connect(ctx) {
+  switch (ctx.connectProtocol) {
+    case 'websocket': {
+      const ws = ctx.upgradeWebSocket();
+      ws.addEventListener('message', e => ws.send(`Echo: ${e.data}`));
+      return;
+    }
+    case 'webtransport': {
+      const session = await ctx.upgradeWebTransport();
+      handleWebTransport(session);
+      return;
+    }
+    case 'connect-udp': {
+      const tunnel = await ctx.accept();
+      const dg = tunnel.datagrams();
+      pipeUdpPayloads(dg);
+      return;
+    }
+    default:
+      return new Response(null, { status: 501 });
+  }
+}
+```
+
+If no `connect()` handler is provided, the implementation responds to CONNECT requests with 501 Not Implemented.
+
+Error handling {#handler-errors}
+--------------------------------
+
+<table>
+  <thead>
+    <tr><th>Condition</th><th>Behavior</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Handler calls {{ServerContext/deny()}}, returns undefined</td><td>Stream reset (per error code)</td></tr>
+    <tr><td>Handler calls {{ServerContext/deny()}} with `ERR_HTTP_GOAWAY`</td><td>Stream reset + GOAWAY on the connection</td></tr>
+    <tr><td>`fetch()` handler returns a {{Response}}</td><td>That response is sent</td></tr>
+    <tr><td>`fetch()` handler throws</td><td>500 Internal Server Error</td></tr>
+    <tr><td>`fetch()` handler returns rejected promise</td><td>500 Internal Server Error</td></tr>
+    <tr><td>`connect()` handler returns a {{Response}}</td><td>That response is sent</td></tr>
+    <tr><td>`connect()` handler returns `undefined`</td><td>Tunnel accepted (via accept/upgrade)</td></tr>
+    <tr><td>`connect()` handler throws</td><td>502 Bad Gateway</td></tr>
+    <tr><td>`connect()` handler returns rejected promise</td><td>502 Bad Gateway</td></tr>
+  </tbody>
+</table>
+
+The handler object {#handler-object}
+-------------------------------------
+
+Handlers are provided as an object with `fetch` and/or `connect` methods:
+
+```js
+const handler = {
+  [Symbol.for('server.protocol')]: 1,
+
+  fetch(ctx) {
+    return new Response("Hello");
+  },
+  connect(ctx) {
+    // ...
+  },
+};
+
+serve(handler, { port: 8080 });
+```
+
+When the handler is an object with methods, `this` inside the handler refers to the handler object. This allows the handler object to carry application state:
+
+```js
+const app = {
+  [Symbol.for('server.protocol')]: 1,
+  db: createPool(process.env.DATABASE_URL),
+
+  async fetch(ctx) {
+    const rows = await this.db.query('SELECT * FROM users');
+    return Response.json(rows);
+  },
+
+  async [Symbol.asyncDispose]() {
+    await this.db.end();
+  },
+};
+
+serve(app, { port: 443, tls: { cert, key } });
+```
+
+Declarative export and protocol identification {#handler-declarative}
+---------------------------------------------------------------------
+
+As an alternative to the imperative `serve()` call, an application may export a default handler object. Because existing runtimes already use `export default { fetch() {} }` with different handler signatures (e.g., Cloudflare Workers passes `(Request, Env, ExecutionContext)`, Deno passes `(Request, ServeHandlerInfo)`), a handler object includes a [=protocol marker=] so the runtime can distinguish this API from legacy invocation conventions.
+
+The marker is a `Symbol.for('server.protocol')` property with an integer version value:
+
+```js
+export default {
+  [Symbol.for('server.protocol')]: 1,
+
+  async fetch(ctx) {
+    return new Response("Hello");
+  },
+
+  async connect(ctx) {
+    if (ctx.connectProtocol === 'websocket') {
+      const ws = ctx.upgradeWebSocket();
+      ws.addEventListener('message', e => ws.send(e.data));
+      return;
+    }
+    return new Response(null, { status: 501 });
+  },
+};
+```
+
+A conforming runtime that supports declarative export checks for the presence and value of `Symbol.for('server.protocol')` on the default export before invoking handler methods:
+
+*   If `Symbol.for('server.protocol')` is present and its value is `1`, the runtime invokes `fetch()` with a {{ServerContext}} and `connect()` with a {{ConnectContext}}.
+*   If `Symbol.for('server.protocol')` is absent, the runtime invokes handler methods using its existing (legacy) calling convention. Existing application code continues to work without modification.
+*   If `Symbol.for('server.protocol')` is present but its value is not a recognized version, the runtime rejects the handler with a descriptive error.
+
+The version number allows the protocol to evolve. This specification defines version `1`. Future revisions that change handler signatures would increment the version.
+
+The **handler object** is the portable unit. The same handler object works with both patterns:
+
+```js
+const handler = {
+  [Symbol.for('server.protocol')]: 1,
+  fetch(ctx) { return new Response("Hello"); },
+};
+
+// In Workers or similar edge runtime:
+export default handler;
+
+// In Node.js, Deno, or Bun:
+serve(handler, { port: 443, tls: { cert, key } });
+```
+
+
+Server configuration {#server-configuration}
+=============================================
+
+The serve() function {#serve-function}
+--------------------------------------
+
+<div algorithm>
+The <dfn method for="FetchServer">serve(handler, options)</dfn> function creates a {{Server}}. If {{ServerOptions/hostname}} and {{ServerOptions/port}} (or {{ServerOptions/signal}}) are provided in the |options|, the server begins listening immediately. Otherwise, the server is created in an unbound state and must be explicitly started with {{Server/listen()}}.
+</div>
+
+```js
+// One-step: create and listen
+const server = serve({
+  [Symbol.for('server.protocol')]: 1,
+  fetch(ctx) {
+    return new Response("Hello");
+  },
+}, {
+  port: 443,
+  hostname: '0.0.0.0',
+  tls: {
+    cert: readFileSync('cert.pem'),
+    key: readFileSync('key.pem'),
+  },
+  quic: true,
+});
+
+// Two-step: create then listen
+const server = serve({
+  [Symbol.for('server.protocol')]: 1,
+  fetch(ctx) {
+    return new Response("Hello");
+  },
+}, {
+  tls: { cert, key },
+});
+
+await server.listen({ port: 443, hostname: '0.0.0.0' });
+```
+
+ServerOptions {#serve-options}
+------------------------------
+
+When {{ServerOptions/port}} is `0`, the operating system assigns an available port. When {{ServerOptions/hostname}} is omitted but {{ServerOptions/port}} is provided, the default bind address is `"0.0.0.0"`.
+
+TLS configuration {#serve-tls}
+------------------------------
+
+When {{ServerOptions/tls}} is provided, the server listens for TLS connections and negotiates ALPN. The default ALPN list is `["h2", "http/1.1"]`.
+
+### SNI-based certificate selection ### {#serve-tls-sni}
+
+The {{TLSOptions/sni}} option enables serving multiple hostnames with different certificates on the same listener. It can be either an object mapping hostnames to certificates or a callback function.
+
+**Object form** &mdash; when the set of hostnames is known up front:
+
+```js
+serve(handler, {
+  port: 443,
+  tls: {
+    cert: defaultCert,
+    key: defaultKey,
+    sni: {
+      'example.com': { cert: exampleCert, key: exampleKey },
+      '*.example.com': { cert: wildcardCert, key: wildcardKey },
+      'other.net': { cert: otherCert, key: otherKey },
+    },
+  },
+});
+```
+
+Keys support leading wildcard labels following [RFC 6125](https://www.rfc-editor.org/rfc/rfc6125) Section 6.4.3 matching rules.
+
+**Callback form** &mdash; for dynamic selection (ACME, vault lookup, etc.):
+
+```js
+serve(handler, {
+  port: 443,
+  tls: {
+    cert: defaultCert,
+    key: defaultKey,
+    async sni(hostname) {
+      const record = await certStore.lookup(hostname);
+      if (record) return { cert: record.cert, key: record.key };
+      return null;  // fall through to default
+    },
+  },
+});
+```
+
+QUIC configuration {#serve-quic}
+--------------------------------
+
+When {{ServerOptions/quic}} is `true` or a {{QUICOptions}} object, the server additionally listens for QUIC connections on the same port and supports HTTP/3.
+
+HTTP/3 requires TLS. If {{ServerOptions/quic}} is enabled and {{ServerOptions/tls}} is not provided, the implementation throws a {{TypeError}}.
+
+
+Server and Listener {#server-listener}
+======================================
+
+{{Server}} and {{Listener}} share the {{Closeable}} interface for lifecycle management. On a {{Listener}}, these apply to a single binding. On a {{Server}}, they apply to all listeners collectively.
+
+Binding and listeners {#server-binding}
+---------------------------------------
+
+<div algorithm>
+The <dfn method for="Server">listen(options)</dfn> method binds the server to a network address and returns a `Promise<Listener>` that resolves when the binding is established.
+</div>
+
+{{Server/listen()}} may be called multiple times to bind the server to multiple addresses or ports:
+
+```js
+const server = serve(handler);
+const http  = await server.listen({ port: 80 });
+const https = await server.listen({ port: 443, tls: { cert, key } });
+const quic  = await server.listen({ port: 443, tls: { cert, key }, quic: true });
+```
+
+{{Server}} is iterable over its active listeners:
+
+```js
+for (const listener of server) {
+  console.log(listener.address);
+}
+```
+
+### One-step vs. two-step vs. multi-listener ### {#server-binding-patterns}
+
+```js
+// One-step: serve() with port (single listener)
+const server = serve(handler, { port: 8080 });
+
+// Two-step: serve() then listen() (single listener)
+const server = serve(handler);
+await server.listen({ port: 8080 });
+
+// Multi-listener: HTTP + HTTPS + HTTP/3
+const server = serve(handler);
+await server.listen({ port: 80 });
+await server.listen({ port: 443, tls: { cert, key, sni } });
+await server.listen({ port: 443, tls: { cert, key }, quic: true });
+```
+
+The Closeable interface {#closeable}
+------------------------------------
+
+The {{Closeable}} mixin provides a uniform lifecycle interface shared by {{Server}} and {{Listener}}.
+
+### busy ### {#closeable-busy}
+
+<div algorithm>
+When <dfn attribute for="Closeable">busy</dfn> is `true`, new requests are not dispatched to handlers. In-flight requests continue to be processed.
+</div>
+
+Note: {{Closeable/busy}} is intended for brief back-pressure scenarios such as waiting for a downstream dependency to recover, performing a configuration reload, or coordinating with a load balancer during a rolling deploy. For permanent shutdown, use {{Closeable/close()}}.
+
+### close() ### {#closeable-close}
+
+<div algorithm>
+The <dfn method for="Closeable">close()</dfn> method initiates graceful shutdown.
+
+On a {{Listener}}, it stops accepting new connections, sends GOAWAY frames on HTTP/2 and HTTP/3 connections, allows in-flight requests to complete, and resolves when all connections are closed.
+
+On a {{Server}}, it calls {{Closeable/close()}} on every active listener and waits for all {{ServerContext/waitUntil()}} promises to settle.
+
+Closing a listener does not close the server. Other listeners remain active.
+</div>
+
+### destroy() ### {#closeable-destroy}
+
+<div algorithm>
+The <dfn method for="Closeable">destroy(error)</dfn> method immediately terminates without draining.
+</div>
+
+<table>
+  <thead>
+    <tr><th>Behavior</th><th>`close()`</th><th>`destroy()`</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>New connections</td><td>Refused</td><td>Refused</td></tr>
+    <tr><td>GOAWAY sent</td><td>Yes</td><td>No</td></tr>
+    <tr><td>In-flight requests</td><td>Allowed to complete</td><td>Aborted immediately</td></tr>
+    <tr><td>`waitUntil()` promises</td><td>Allowed to settle</td><td>Ignored</td></tr>
+    <tr><td>{{Closeable/closed}} promise</td><td>Resolves</td><td>Rejects (if error)</td></tr>
+    <tr><td>Returns</td><td>Promise (async)</td><td>undefined (sync)</td></tr>
+  </tbody>
+</table>
+
+### closed ### {#closeable-closed}
+
+<div algorithm>
+The <dfn attribute for="Closeable">closed</dfn> attribute returns a promise that resolves when the server or listener is fully closed.
+</div>
+
+### Symbol.asyncDispose ### {#closeable-dispose}
+
+Both {{Server}} and {{Listener}} implement `Symbol.asyncDispose`, which calls {{Closeable/close()}} and waits for the {{Closeable/closed}} promise.
+
+```js
+{
+  await using server = serve(handler, { port: 8080 });
+  // Server is running
+}
+// Server has been gracefully closed
+```
+
+Signal-based termination {#server-signal}
+-----------------------------------------
+
+If an {{AbortSignal}} is provided in {{ServerOptions}}, aborting the signal triggers abrupt termination (equivalent to calling {{Closeable/destroy()}} with the signal's reason).
+
+```js
+const ac = new AbortController();
+const server = serve(handler, { port: 8080, signal: ac.signal });
+
+// Later:
+ac.abort(new Error('shutting down'));  // Triggers destroy()
+await server.closed.catch(() => {});
+```
+
+For graceful close, call {{Closeable/close()}} directly rather than using the signal.
+
+
+HTTP version negotiation {#http-versions}
+=========================================
+
+Transparent protocol handling {#http-versions-transparent}
+----------------------------------------------------------
+
+A conforming implementation routes requests to the appropriate handler regardless of HTTP version. The `fetch()` handler receives all non-CONNECT requests. The `connect()` handler receives all CONNECT and extended CONNECT requests. The handler does not select which HTTP version to handle.
+
+Feature availability by protocol version {#http-versions-features}
+-------------------------------------------------------------------
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Trailers (request)</td><td>Chunked TE only</td><td>Yes</td><td>Yes</td></tr>
+    <tr><td>Trailers (response)</td><td>Chunked TE only</td><td>Yes</td><td>Yes</td></tr>
+    <tr><td>Informational responses</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+    <tr><td>Extended CONNECT</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+    <tr><td>WebSocket</td><td>Via Upgrade</td><td>Via ext. CONNECT</td><td>Via ext. CONNECT</td></tr>
+    <tr><td>WebTransport</td><td>No</td><td>Capsule fallback</td><td>Native QUIC</td></tr>
+    <tr><td>HTTP Datagrams (unreliable)</td><td>No</td><td>No</td><td>Yes (QUIC DG)</td></tr>
+    <tr><td>HTTP Datagrams (reliable)</td><td>No</td><td>Yes (capsule)</td><td>Yes (capsule)</td></tr>
+    <tr><td>CONNECT-UDP</td><td>No</td><td>Capsule fallback</td><td>Native QUIC DG</td></tr>
+    <tr><td>CONNECT-IP</td><td>No</td><td>Capsule fallback</td><td>Native QUIC DG</td></tr>
+    <tr><td>Full-duplex streaming</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+  </tbody>
+</table>
+
+
+Security considerations {#security}
+====================================
+
+*   **No CORS Enforcement**: This specification is for server-side runtimes. CORS is a browser security mechanism. Server-side implementations do not enforce CORS restrictions.
+
+*   **Header Filtering**: Implementations should apply appropriate header filtering. Hop-by-hop headers are processed by the implementation and generally not exposed in {{Request}} headers. Trailer field filtering per [RFC 9110 Section 6.5.2](https://www.rfc-editor.org/rfc/rfc9110#section-6.5.2) should remove fields not appropriate as trailers.
+
+*   **Tunnel Security**: The `connect()` handler establishes tunnels that can carry arbitrary traffic. Applications must perform their own authorization before calling {{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}, or {{ConnectContext/upgradeWebTransport()}}.
+
+*   **Denial of Service**: WebTransport sessions can open many streams; implementations should impose limits. {{ServerContext/waitUntil()}} extends request lifetime; implementations should impose timeouts. The Capsule Protocol and datagrams can generate high throughput; implementations should apply flow control.
+
+
+Open issues {#open-issues}
+==========================
+
+### Module specifier ### {#open-module-specifier}
+
+The import path for `serve()` is left implementation-defined. Possible values include:
+
+*   `node:http` (extending the existing Node.js module)
+*   `node:serve` (new Node.js module)
+*   `http` (generic, non-Node.js-specific)
+
+A standardized module specifier may be desirable if this API is adopted by WinterTC.
+
+### Structured fields on Headers ### {#open-structured-fields}
+
+[RFC 9651](https://www.rfc-editor.org/rfc/rfc9651) defines typed values (integers, booleans, tokens, byte sequences, etc.) for HTTP fields. The {{Headers}} interface exposes only raw strings. Adding structured field parsing to {{Headers}} (e.g., a `getStructured()` method) would benefit many use cases beyond priority.
+
+This is a potential change to the Fetch Standard's {{Headers}} type and is out of scope for this specification, but would complement it.
+
+### Full-duplex streaming ### {#open-full-duplex}
+
+HTTP/2 and HTTP/3 support full-duplex streaming: the request body and response body are independent streams that can be read/written concurrently with independent half-close.
+
+The Fetch Standard's `duplex` property currently allows only `"half"` for requests.
+
+For server-side handlers, full-duplex is implicit: the handler can begin writing a response (via a {{ReadableStream}} body) while the request body is still being received.
+
+### Typed stream resets and error codes ### {#open-typed-resets}
+
+HTTP/2 RST_STREAM and HTTP/3 RESET_STREAM/STOP_SENDING frames carry error codes. `AbortSignal.reason` provides an arbitrary JavaScript value but has no mapping to protocol-level error codes.
+
+The {{ServerContext/deny()}} method addresses one direction of this problem: a server sending a typed stream reset to a client. The same taxonomy applies in the other direction: when a client receives a stream reset from a server, the error code should be surfaced on the resulting {{TypeError}}. The [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property) would enable this.
+
+### ServerResponse ### {#open-server-response}
+
+This specification currently requires no server-specific response type. Handlers return a standard {{Response}} with trailer support provided by the Fetch Standard.
+
+If future server-specific response capabilities are identified (e.g., server push, priority signaling, response-side lifecycle), a `ServerResponse` type may be introduced. The handler model is designed to accommodate this: the `fetch()` handler's return type can be extended to include `ServerResponse` without breaking existing handlers that return {{Response}}.
+
+
+Addendum: Raw TCP sockets {#addendum-tcp}
+=========================================
+
+The handler object pattern is designed to be extensible. New handler methods can be added without changing existing signatures. This addendum sketches how the model extends to support raw TCP ingress &mdash; connections that are not HTTP.
+
+Motivation {#tcp-motivation}
+----------------------------
+
+Some server-side runtimes (e.g., Cloudflare Workers) support arbitrary TCP ingress where non-HTTP connections are routed to the application. These connections carry raw bytes &mdash; no HTTP framing, no request method, no headers. They need a different handler and a different context.
+
+SocketContext {#tcp-socketcontext}
+----------------------------------
+
+A `SocketContext` provides a WinterTC [Socket](https://sockets-api.proposal.wintertc.org/) and connection metadata. It is not related to {{ServerContext}} by inheritance &mdash; there is no HTTP {{Request}}, no {{ServerContext/sendInformational()}}, no {{ServerContext/deny()}}.
+
+<pre class="idl">
+[Exposed=*]
+interface SocketContext {
+  [SameObject] readonly attribute object socket;
+  readonly attribute SocketAddress remoteAddress;
+  readonly attribute DOMString alpnProtocol;
+  readonly attribute DOMString? serverName;
+  undefined waitUntil(Promise&lt;any> promise);
+};
+</pre>
+
+*   {{SocketContext/socket}} &mdash; a `Socket` with `readable` and `writable` streams. Already connected; TLS (if any) is complete.
+*   {{SocketContext/remoteAddress}} &mdash; the remote peer's {{SocketAddress}}.
+*   {{SocketContext/alpnProtocol}} &mdash; ALPN protocol from TLS negotiation, or empty string. Can be any application-defined identifier, not just HTTP versions.
+*   {{SocketContext/serverName}} &mdash; SNI hostname from TLS ClientHello, or `null`. Useful for multi-tenant routing.
+*   {{SocketContext/waitUntil()}} &mdash; lifecycle extension, same as {{ServerContext/waitUntil()}}.
+
+SocketHandler {#tcp-sockethandler}
+----------------------------------
+
+<pre class="idl">
+callback SocketHandler = (undefined or Promise&lt;undefined>)
+                         (SocketContext ctx);
+</pre>
+
+A `socket()` method is added to the handler object:
+
+```js
+export default {
+  [Symbol.for('server.protocol')]: 1,
+  fetch(ctx) { /* HTTP request/response */ },
+  connect(ctx) { /* HTTP tunnels */ },
+  socket(ctx) { /* Raw TCP connections */ },
+};
+```
+
+Routing {#tcp-routing}
+----------------------
+
+How the implementation distinguishes HTTP from non-HTTP connections is implementation-defined. Common approaches include port-based routing, ALPN-based routing (a non-HTTP ALPN token), or protocol detection (inspecting the first bytes of the connection).
+
+If no `socket()` handler is provided and a non-HTTP connection arrives, the implementation closes the connection. If the handler throws, the implementation closes the socket.

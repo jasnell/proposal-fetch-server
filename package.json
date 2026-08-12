@@ -1,0 +1,39 @@
+{
+  "name": "fetch-server",
+  "version": "0.1.0",
+  "author": "James M Snell <jasnell@gmail.com>",
+  "description": "Proposal for a server-side HTTP API built on Fetch Standard types",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "build:spec": "bash build-spec.sh",
+    "test": "node --import tsx --test src/**/*.test.ts",
+    "test:watch": "node --import tsx --test --watch src/**/*.test.ts",
+    "samples": "for f in samples/[0-9]*.ts; do echo \"=== $f ===\"; npx tsx \"$f\" || true; done",
+    "samples:run": "npx tsx",
+    "lint": "eslint src/ samples/",
+    "lint:fix": "eslint src/ samples/ --fix"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^20.11.0",
+    "eslint": "^10.0.2",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3",
+    "typescript-eslint": "^8.56.1"
+  },
+  "keywords": [
+    "http",
+    "server",
+    "fetch",
+    "request",
+    "response"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jasnell/fetch-server.git"
+  }
+}
