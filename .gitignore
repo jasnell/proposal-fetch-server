@@ -2,3 +2,4 @@ node_modules/
 dist/
 out/
 index.html
+.wrangler
