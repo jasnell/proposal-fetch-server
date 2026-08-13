@@ -31,11 +31,11 @@ spec:dom; type:dfn; text:aborted flag
 spec:dom; type:dfn; text:signal abort
 </pre>
 
-<h2 class="no-num" id="intro">Introduction</h2>
-
-<div class="note">
-This document is a <strong>proposal</strong> to ECMA TC55 (WinterTC). It has not been adopted as a standard and may change substantially based on committee feedback. It is published for review and discussion purposes.
+<div class="warning">
+This document is <strong>not yet an official WinterTC draft</strong>. It is an individual proposal intended to be submitted to ECMA TC55 (WinterTC) for consideration. It has not been adopted, endorsed, or reviewed by the committee. The content may change substantially before or during that process.
 </div>
+
+<h2 class="no-num" id="intro">Introduction</h2>
 
 The [Fetch Standard](https://fetch.spec.whatwg.org/) defined {{Request}}, {{Response}}, {{Headers}}, and `fetch()` for browser HTTP clients. Server-side runtimes adopted these types but diverged on everything around them.
 
