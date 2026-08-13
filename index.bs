@@ -18,12 +18,11 @@ spec:fetch; type:dictionary; text:ResponseInit
 
 spec:dom; type:interface; text:AbortSignal
 spec:dom; type:interface; text:AbortController
-spec:dom; type:interface; text:DOMException
 
 spec:streams; type:interface; text:ReadableStream
 spec:streams; type:interface; text:WritableStream
 
-spec:html; type:interface; text:WebSocket
+spec:webidl; type:interface; text:DOMException
 
 spec:dom; type:dfn; for:AbortSignal; text:aborted
 spec:dom; type:dfn; text:aborted flag
@@ -46,7 +45,7 @@ This specification defines a server-side API that:
 *   Handles both request/response exchanges and tunnel protocols (extended CONNECT).
 *   Defines primitives for the Capsule Protocol and HTTP Datagrams.
 
-### Goals ### {#goals}
+<h3 class="no-num" id="goals">Goals</h3>
 
 1.  **One server-side programming model for all HTTP versions**: A handler should not need to know whether a request arrived over HTTP/1.1, HTTP/2, or HTTP/3. Protocol-version-specific behavior is the implementation's concern, not the application's.
 
@@ -60,7 +59,7 @@ This specification defines a server-side API that:
 
 6.  **Extensibility for future protocols**: Extended CONNECT is designed to carry new protocols. The handler model accommodates new `:protocol` values without API changes and allows for entirely new handlers to be defined.
 
-### Non-Goals ### {#non-goals}
+<h3 class="no-num" id="non-goals">Non-Goals</h3>
 
 1.  **Routing**: This specification does not define a router, URL pattern matching, or request dispatch. Routing is an application or framework concern.
 
@@ -72,7 +71,7 @@ This specification defines a server-side API that:
 
 5.  **Browser implementation**: This specification targets server-side runtimes.
 
-### Relationship to Existing Specifications ### {#related-specs}
+<h3 class="no-num" id="related-specs">Relationship to Existing Specifications</h3>
 
 *   [Fetch Standard](https://fetch.spec.whatwg.org/): This specification depends on the {{Request}}, {{Response}}, {{Headers}}, and body definitions from Fetch. It assumes that {{Request}} and {{Response}} support trailers (`Promise<Headers>` `.trailers` property, `trailers` constructor option) and that `fetch()` supports an `onInformation` callback for receiving informational responses on the client side.
 *   [Streams Standard](https://streams.spec.whatwg.org/): {{ReadableStream}} and {{WritableStream}} are used for bodies, tunnel data, capsules, and datagrams.
@@ -85,9 +84,9 @@ This specification defines a server-side API that:
 *   [RFC 9484](https://www.rfc-editor.org/rfc/rfc9484): Proxying IP in HTTP.
 *   [RFC 9651](https://www.rfc-editor.org/rfc/rfc9651): Structured Field Values for HTTP.
 
-### Design Rationale ### {#design-rationale}
+<h3 class="no-num" id="design-rationale">Design Rationale</h3>
 
-#### Why a context object? #### {#why-context}
+<h4 class="no-num" id="why-context">Why a context object?</h4>
 
 The properties needed on the server side fall into distinct categories:
 
@@ -113,7 +112,7 @@ Runtimes have independently arrived at similar patterns:
 
 A single context object avoids positional fragility and extends without signature changes.
 
-#### Why not extend Request and Response? #### {#why-not-extend}
+<h4 class="no-num" id="why-not-extend">Why not extend Request and Response?</h4>
 
 Subtyping (`ServerRequest extends Request`) creates structural compatibility questions: which client-specific {{Request}} properties (`.cache`, `.credentials`, `.mode`, `.redirect`, `.destination`) should a server-side subtype expose, and with what values? These properties are meaningless for incoming server requests.
 
@@ -182,11 +181,11 @@ For the purposes of this document, the terms and definitions given in [[ECMASCRI
 
 the server-side HTTP API defined by this specification
 
-<h3 class="no-toc" id="term-web-interoperable-runtime"><dfn>web-interoperable runtime</dfn></h3>
+<h3 class="no-toc" id="term-web-interoperable-runtime"><dfn export>web-interoperable runtime</dfn></h3>
 
 ECMAScript-based runtime environment as defined by WinterTC
 
-<h3 class="no-toc" id="term-server"><dfn>server</dfn></h3>
+<h3 class="no-toc" id="term-server"><dfn dfn-type="dfn" id="dfn-server">server</dfn></h3>
 
 an entity that accepts HTTP connections, receives requests, and sends responses
 
@@ -194,11 +193,11 @@ an entity that accepts HTTP connections, receives requests, and sends responses
 
 a JavaScript function provided by the application that processes incoming requests or tunnel establishment attempts
 
-<h3 class="no-toc" id="term-tunnel"><dfn>tunnel</dfn></h3>
+<h3 class="no-toc" id="term-tunnel"><dfn dfn-type="dfn" id="dfn-tunnel">tunnel</dfn></h3>
 
 a long-lived bidirectional communication channel established through an HTTP connection via the CONNECT method or extended CONNECT
 
-<h3 class="no-toc" id="term-connect-protocol"><dfn>connect protocol</dfn></h3>
+<h3 class="no-toc" id="term-connect-protocol"><dfn export>connect protocol</dfn></h3>
 
 the value of the `:protocol` pseudo-header in an extended CONNECT request, identifying the protocol being tunneled (e.g., `"websocket"`, `"webtransport"`, `"connect-udp"`, `"connect-ip"`)
 
@@ -239,20 +238,16 @@ Callback definitions {#idl-callbacks}
 -------------------------------------
 
 <pre class="idl">
-callback PriorityCallback = undefined (RequestPriority priority);
+callback PriorityCallback = undefined (optional RequestPriority priority = {});
 
-callback FetchHandler = (Response or undefined or
-                         Promise&lt;Response or undefined>)
-                        (ServerContext ctx);
+callback FetchHandler = any (ServerContext ctx);
 
-callback ConnectHandler = (Response or undefined or
-                           Promise&lt;Response or undefined>)
-                          (ConnectContext ctx);
+callback ConnectHandler = any (ConnectContext ctx);
 </pre>
 
-The {{FetchHandler}} callback receives a {{ServerContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one.
+The {{FetchHandler}} callback receives a {{ServerContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one of those. The return type is specified as `any` because Web IDL cannot express `(Response or undefined or Promise<Response or undefined>)` as a callback return type.
 
-The {{ConnectHandler}} callback receives a {{ConnectContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one.
+The {{ConnectHandler}} callback receives a {{ConnectContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one of those.
 
 Options dictionaries {#idl-options}
 -----------------------------------
@@ -272,8 +267,7 @@ dictionary TLSCertificate {
   (DOMString or BufferSource) key;
 };
 
-callback SNICallback = (TLSCertificate or Promise&lt;TLSCertificate> or null)
-                       (DOMString hostname);
+callback SNICallback = any (DOMString hostname);
 
 dictionary TLSOptions : TLSCertificate {
   sequence&lt;DOMString> alpn;
@@ -299,7 +293,7 @@ dictionary ListenOptions {
 };
 
 dictionary HandlerObject {
-  FetchHandler fetch;
+  required FetchHandler fetch;
   ConnectHandler connect;
 };
 </pre>
@@ -340,7 +334,7 @@ interface ConnectContext : ServerContext {
 
   Promise&lt;Tunnel> accept(optional ResponseInit init = {});
 
-  WebSocket upgradeWebSocket(optional WebSocketUpgradeInit options = {});
+  object upgradeWebSocket(optional WebSocketUpgradeInit options = {});
   Promise&lt;WebTransportSession> upgradeWebTransport();
 };
 </pre>
@@ -473,7 +467,7 @@ The Server interface {#idl-server}
 <pre class="idl">
 [Exposed=*]
 interface Server {
-  Promise&lt;Listener> listen(ListenOptions options);
+  Promise&lt;Listener> listen(optional ListenOptions options = {});
   iterable&lt;Listener>;
 };
 Server includes Closeable;
@@ -496,8 +490,8 @@ The namespace `FetchServer` is used here for specification purposes. The actual 
 </div>
 
 
-ServerContext {#servercontext}
-==============================
+ServerContext {#sec-servercontext}
+==================================
 
 The request {#servercontext-request}
 ------------------------------------
@@ -507,12 +501,14 @@ The <dfn attribute for="ServerContext">request</dfn> attribute returns a standar
 
 The {{Request}} is constructed by the implementation from the incoming HTTP message. It has:
 
-*   `method`: The HTTP method.
-*   `url`: The full request URL, reconstructed from the request target, `Host` header, and connection properties (scheme, port).
-*   `headers`: The request header fields.
-*   `body`: The request body as a {{ReadableStream}}, or `null`.
-*   `signal`: An {{AbortSignal}} that is aborted if the client disconnects or the connection is lost.
-*   `trailers`: A `Promise<Headers>` that resolves to the trailing header fields after the body is consumed.
+<ul>
+<li>`method`: The HTTP method.
+<li>`url`: The full request URL, reconstructed from the request target, `Host` header, and connection properties (scheme, port).
+<li>`headers`: The request header fields.
+<li>`body`: The request body as a {{ReadableStream}}, or `null`.
+<li>`signal`: An {{AbortSignal}} that is aborted if the client disconnects or the connection is lost.
+<li>`trailers`: A `Promise<Headers>` that resolves to the trailing header fields after the body is consumed.
+</ul>
 </div>
 
 Because `ctx.request` is a standard {{Request}}, it can be passed directly to client-side `fetch()` for proxying:
@@ -628,27 +624,27 @@ The optional |error| argument controls the protocol-level error code. If the err
   </thead>
   <tbody>
     <tr>
-      <td><dfn>`ERR_HTTP_REQUEST_REJECTED`</dfn></td>
+      <td><dfn export>`ERR_HTTP_REQUEST_REJECTED`</dfn></td>
       <td>REFUSED_STREAM (HTTP/2), H3_REQUEST_REJECTED (HTTP/3)</td>
       <td>Not processed. Client may safely retry.</td>
     </tr>
     <tr>
-      <td><dfn>`ERR_HTTP_REQUEST_CANCELLED`</dfn></td>
+      <td><dfn export>`ERR_HTTP_REQUEST_CANCELLED`</dfn></td>
       <td>CANCEL (HTTP/2), H3_REQUEST_CANCELLED (HTTP/3)</td>
       <td>Intentionally cancelled. May have been partially processed.</td>
     </tr>
     <tr>
-      <td><dfn>`ERR_HTTP_INTERNAL_ERROR`</dfn></td>
+      <td><dfn export>`ERR_HTTP_INTERNAL_ERROR`</dfn></td>
       <td>INTERNAL_ERROR (HTTP/2), H3_INTERNAL_ERROR (HTTP/3)</td>
       <td>Internal error in the server.</td>
     </tr>
     <tr>
-      <td><dfn>`ERR_HTTP_CONNECT_ERROR`</dfn></td>
+      <td><dfn export>`ERR_HTTP_CONNECT_ERROR`</dfn></td>
       <td>CONNECT_ERROR (HTTP/2), H3_CONNECT_ERROR (HTTP/3)</td>
       <td>Tunnel-specific error.</td>
     </tr>
     <tr>
-      <td><dfn>`ERR_HTTP_GOAWAY`</dfn></td>
+      <td><dfn export>`ERR_HTTP_GOAWAY`</dfn></td>
       <td>GOAWAY frame (HTTP/2), GOAWAY frame (HTTP/3)</td>
       <td>Close the connection after finishing in-flight streams.</td>
     </tr>
@@ -683,8 +679,8 @@ This is analogous to `ExtendableEvent.waitUntil()` in [Service Workers](https://
 An implementation MAY impose an implementation-defined time limit on how long it will wait for outstanding {{ServerContext/waitUntil()}} promises to settle.
 
 
-ConnectContext {#connectcontext}
-================================
+ConnectContext {#sec-connectcontext}
+====================================
 
 Protocol identification {#connectcontext-protocol}
 ---------------------------------------------------
@@ -692,12 +688,14 @@ Protocol identification {#connectcontext-protocol}
 <div algorithm>
 The <dfn attribute for="ConnectContext">connectProtocol</dfn> attribute returns the value of the `:protocol` pseudo-header for extended CONNECT requests:
 
-*   `"websocket"` &mdash; WebSocket over HTTP/2 or HTTP/3
-*   `"webtransport"` &mdash; WebTransport session
-*   `"connect-udp"` &mdash; UDP proxying
-*   `"connect-ip"` &mdash; IP proxying
-*   Any other registered or private-use protocol identifier
-*   `null` &mdash; Plain CONNECT (no `:protocol` pseudo-header; TCP tunneling)
+<ul>
+<li>`"websocket"` &mdash; WebSocket over HTTP/2 or HTTP/3
+<li>`"webtransport"` &mdash; WebTransport session
+<li>`"connect-udp"` &mdash; UDP proxying
+<li>`"connect-ip"` &mdash; IP proxying
+<li>Any other registered or private-use protocol identifier
+<li>`null` &mdash; Plain CONNECT (no `:protocol` pseudo-header; TCP tunneling)
+</ul>
 </div>
 
 HTTP/1.1 upgrade normalization {#connectcontext-upgrade}
@@ -722,9 +720,9 @@ WebSocket upgrade {#connectcontext-websocket}
 ---------------------------------------------
 
 <div algorithm>
-The <dfn method for="ConnectContext">upgradeWebSocket(options)</dfn> method is a convenience for WebSocket tunnel establishment. It performs the WebSocket-specific handshake (including subprotocol negotiation if |options|.{{WebSocketUpgradeInit/protocol}} is provided) and returns a standard {{WebSocket}} object already in the `OPEN` state.
+The <dfn method for="ConnectContext">upgradeWebSocket(options)</dfn> method is a convenience for WebSocket tunnel establishment. It performs the WebSocket-specific handshake (including subprotocol negotiation if |options|.{{WebSocketUpgradeInit/protocol}} is provided) and returns a standard [`WebSocket`](https://html.spec.whatwg.org/multipage/web-sockets.html#websocket) object already in the `OPEN` state.
 
-If {{ConnectContext/connectProtocol}} is not `"websocket"`, this method throws an `InvalidStateError` {{DOMException}}.
+If {{ConnectContext/connectProtocol}} is not `"websocket"`, this method throws an `"InvalidStateError"` {{DOMException}}.
 </div>
 
 WebTransport upgrade {#connectcontext-webtransport}
@@ -733,7 +731,7 @@ WebTransport upgrade {#connectcontext-webtransport}
 <div algorithm>
 The <dfn method for="ConnectContext">upgradeWebTransport()</dfn> method establishes a WebTransport session. It returns a `Promise<WebTransportSession>` that resolves when the session is established.
 
-If {{ConnectContext/connectProtocol}} is not `"webtransport"`, this method throws an `InvalidStateError` {{DOMException}}.
+If {{ConnectContext/connectProtocol}} is not `"webtransport"`, this method throws an `"InvalidStateError"` {{DOMException}}.
 </div>
 
 Denying a tunnel {#connectcontext-deny}
@@ -761,8 +759,8 @@ async connect(ctx) {
 The choice depends on the intended signal: {{ServerContext/deny()}} says "I never processed this" (protocol-level); a {{Response}} says "I processed this and the answer is no" (application-level).
 
 
-Tunnel {#tunnel}
-================
+Tunnel {#sec-tunnel}
+====================
 
 A {{Tunnel}} represents an established [=tunnel=] through an HTTP connection. It provides three layers of communication corresponding to the layers defined in the [Capsule Protocol](https://www.rfc-editor.org/rfc/rfc9297):
 
@@ -783,7 +781,7 @@ Capsule Protocol {#tunnel-capsules}
 -----------------------------------
 
 <div algorithm>
-The <dfn method for="Tunnel">capsules()</dfn> method returns a {{CapsuleStream}} providing typed access to the Capsule Protocol on the CONNECT data stream. Calling {{Tunnel/capsules()}} consumes the raw data stream &mdash; subsequent access to {{Tunnel/readable}} or {{Tunnel/writable}} throws an `InvalidStateError` {{DOMException}}.
+The <dfn method for="Tunnel">capsules()</dfn> method returns a {{CapsuleStream}} providing typed access to the Capsule Protocol on the CONNECT data stream. Calling {{Tunnel/capsules()}} consumes the raw data stream &mdash; subsequent access to {{Tunnel/readable}} or {{Tunnel/writable}} throws an `"InvalidStateError"` {{DOMException}}.
 </div>
 
 ```js
@@ -1183,8 +1181,8 @@ await server.listen({ port: 443, tls: { cert, key, sni } });
 await server.listen({ port: 443, tls: { cert, key }, quic: true });
 ```
 
-The Closeable interface {#closeable}
-------------------------------------
+The Closeable interface {#sec-closeable}
+-----------------------------------------
 
 The {{Closeable}} mixin provides a uniform lifecycle interface shared by {{Server}} and {{Listener}}.
 
@@ -1309,7 +1307,8 @@ Security considerations {#security}
 Open issues {#open-issues}
 ==========================
 
-### Module specifier ### {#open-module-specifier}
+Module specifier {#open-module-specifier}
+-----------------------------------------
 
 The import path for `serve()` is left implementation-defined. Possible values include:
 
@@ -1319,13 +1318,15 @@ The import path for `serve()` is left implementation-defined. Possible values in
 
 A standardized module specifier may be desirable if this API is adopted by WinterTC.
 
-### Structured fields on Headers ### {#open-structured-fields}
+Structured fields on Headers {#open-structured-fields}
+------------------------------------------------------
 
 [RFC 9651](https://www.rfc-editor.org/rfc/rfc9651) defines typed values (integers, booleans, tokens, byte sequences, etc.) for HTTP fields. The {{Headers}} interface exposes only raw strings. Adding structured field parsing to {{Headers}} (e.g., a `getStructured()` method) would benefit many use cases beyond priority.
 
 This is a potential change to the Fetch Standard's {{Headers}} type and is out of scope for this specification, but would complement it.
 
-### Full-duplex streaming ### {#open-full-duplex}
+Full-duplex streaming {#open-full-duplex}
+-----------------------------------------
 
 HTTP/2 and HTTP/3 support full-duplex streaming: the request body and response body are independent streams that can be read/written concurrently with independent half-close.
 
@@ -1333,13 +1334,15 @@ The Fetch Standard's `duplex` property currently allows only `"half"` for reques
 
 For server-side handlers, full-duplex is implicit: the handler can begin writing a response (via a {{ReadableStream}} body) while the request body is still being received.
 
-### Typed stream resets and error codes ### {#open-typed-resets}
+Typed stream resets and error codes {#open-typed-resets}
+-------------------------------------------------------
 
 HTTP/2 RST_STREAM and HTTP/3 RESET_STREAM/STOP_SENDING frames carry error codes. `AbortSignal.reason` provides an arbitrary JavaScript value but has no mapping to protocol-level error codes.
 
 The {{ServerContext/deny()}} method addresses one direction of this problem: a server sending a typed stream reset to a client. The same taxonomy applies in the other direction: when a client receives a stream reset from a server, the error code should be surfaced on the resulting {{TypeError}}. The [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property) would enable this.
 
-### ServerResponse ### {#open-server-response}
+ServerResponse {#open-server-response}
+--------------------------------------
 
 This specification currently requires no server-specific response type. Handlers return a standard {{Response}} with trailer support provided by the Fetch Standard.
 
