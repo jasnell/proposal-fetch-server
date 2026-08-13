@@ -9,8 +9,7 @@ Repository: https://github.com/jasnell/fetch-server
 Editor: James M Snell, Cloudflare https://cloudflare.com/, jsnell@cloudflare.com
 Markup Shorthands: markdown yes
 No Abstract: yes
-Boilerplate: logo no, copyright no, header no
-Favicon: https://fetch-server.proposal.wintertc.org/favicon.ico
+
 </pre>
 <pre class=link-defaults>
 spec:fetch; type:interface; text:Request
