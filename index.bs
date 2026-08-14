@@ -160,15 +160,18 @@ Cloudflare Workers is an example of a runtime that would implement the core laye
 
 A conforming implementation shall also conform to [[!ECMASCRIPT]] and [[!WEBIDL]].
 
-Support for the following features is OPTIONAL at both layers. An implementation that does not support an optional feature MUST still expose the relevant interface members and behave as specified for the unsupported case:
+Support for the following features is OPTIONAL at both layers:
 
 *   Priority
 *   Informational responses
-*   Denial with error codes
 *   Extended CONNECT and tunnel protocols
 *   WebTransport
 *   HTTP Datagrams
 *   HTTP/3 and QUIC
+
+An implementation that does not support an optional feature MUST still expose the relevant interface members. A method whose effect the implementation cannot provide throws a `"NotSupportedError"` {{DOMException}}; promise-returning methods reject with the same error. Priority is the exception: it is advisory by design and degrades silently &mdash; {{ServerContext/clientPriority}} returns the defaults, assignments to {{ServerContext/serverPriority}} are accepted and ignored, and an {{ServerContext/onpriority}} callback is never invoked.
+
+{{ServerContext/deny()}} and {{ServerContext/waitUntil()}} are not optional. Every implementation can decline a request; the wire-level fidelity of [=error codes=] varies by protocol, and where a signal is unavailable the implementation uses the closest supported behavior (e.g., the HTTP/1.1 fallback in [[#servercontext-denial]]). Applications rely on {{ServerContext/waitUntil()}} for cleanup and logging actions that must complete, so every implementation MUST honor it (subject to the time limit in [[#servercontext-lifecycle]]).
 
 Normative references {#normative-references}
 =============================================
@@ -328,7 +331,7 @@ interface ServerContext {
 
   readonly attribute RequestPriority clientPriority;
   attribute RequestPriority? serverPriority;
-  undefined onPriority(PriorityCallback callback);
+  attribute PriorityCallback? onpriority;
 
   undefined sendInformational(unsigned short status,
                               optional HeadersInit headers);
@@ -639,11 +642,9 @@ If the request has no `Priority` header and no PRIORITY_UPDATE frame has been re
 ### Reprioritization ### {#priority-reprioritization}
 
 <div algorithm>
-The <dfn method for="ServerContext">onPriority(callback)</dfn> method registers a |callback| that is invoked when a PRIORITY_UPDATE frame is received for this request's stream. The |callback| receives a {{RequestPriority}} dictionary with the new values.
+The <dfn attribute for="ServerContext">onpriority</dfn> attribute holds the callback invoked when a PRIORITY_UPDATE frame is received for this request's stream, following the web platform's event-handler idiom: `ctx.onpriority = fn`. The callback receives a {{RequestPriority}} dictionary with the new values. The attribute defaults to `null`; because it is a plain attribute, at most one callback is registered at a time, assignment replaces the previous value, and assigning `null` removes it.
 
 PRIORITY_UPDATE frames are hop-by-hop (HTTP/2 and HTTP/3 only) and may arrive at any time during the request lifecycle. If no callback is registered, PRIORITY_UPDATE frames still update {{ServerContext/clientPriority}} &mdash; the handler is simply not notified synchronously.
-
-Only one callback may be registered. A subsequent call to {{ServerContext/onPriority()}} replaces the previous callback. Calling {{ServerContext/onPriority()}} with `null` removes the callback.
 
 For HTTP/1.1, where PRIORITY_UPDATE frames do not exist, the callback is never invoked. The initial priority from the `Priority` header (if present) is still available via {{ServerContext/clientPriority}}.
 </div>
@@ -653,7 +654,7 @@ For HTTP/1.1, where PRIORITY_UPDATE frames do not exist, the callback is never i
 <div algorithm>
 The <dfn attribute for="ServerContext">serverPriority</dfn> attribute is a read/write property that overrides the server-internal scheduling priority for this response's delivery. It defaults to `null`, meaning "use the client's priority signal."
 
-When {{ServerContext/serverPriority}} is `null`, the implementation uses the client's priority signal ({{ServerContext/clientPriority}}) for scheduling. When {{ServerContext/serverPriority}} is set, the implementation uses the server's value instead, regardless of subsequent PRIORITY_UPDATE frames from the client. (The client's updates still appear in {{ServerContext/clientPriority}} and still trigger the {{ServerContext/onPriority()}} callback &mdash; the server simply overrides the scheduling decision.)
+When {{ServerContext/serverPriority}} is `null`, the implementation uses the client's priority signal ({{ServerContext/clientPriority}}) for scheduling. When {{ServerContext/serverPriority}} is set, the implementation uses the server's value instead, regardless of subsequent PRIORITY_UPDATE frames from the client. (The client's updates still appear in {{ServerContext/clientPriority}} and still trigger the {{ServerContext/onpriority}} callback &mdash; the server simply overrides the scheduling decision.)
 </div>
 
 {{ServerContext/serverPriority}} is purely about server-internal scheduling. It does NOT set the `Priority` response header &mdash; that is for signaling priority preferences to intermediaries and is set directly on the {{Response}}:
@@ -674,6 +675,7 @@ Informational responses {#servercontext-informational}
 The <dfn method for="ServerContext">sendInformational(status, headers)</dfn> method sends an informational (1xx) response to the client.
 
 <ol>
+<li>If the implementation does not support informational responses, throw a `"NotSupportedError"` {{DOMException}}.
 <li>If |status| is not in the range 100&ndash;199 inclusive, throw a {{RangeError}}.
 <li>If the [=exchange=] is [=exchange/committed=] or [=exchange/denied=], throw an `"InvalidStateError"` {{DOMException}}.
 <li>If the [=exchange=] is [=exchange/aborted=], return.
@@ -688,7 +690,7 @@ Notable informational status codes:
 *   **100 Continue**: Indicates the server is willing to accept the request body. Sent by the implementation according to the rules below.
 *   **103 Early Hints**: Provides header fields (typically `Link` headers) that the client can use to start preloading resources before the final response ([RFC 8297](https://www.rfc-editor.org/rfc/rfc8297)).
 
-An implementation that does not support informational responses accepts the method call without error and silently discards it.
+An implementation that does not support informational responses throws a `"NotSupportedError"` {{DOMException}} rather than silently discarding the call: a swallowed 1xx would misrepresent observable protocol behavior that applications depend on, such as `Expect: 100-continue` flows and Early Hints preloading.
 
 Note: The Fetch Standard's `onInformation` callback (in `fetch()` options) is the client-side counterpart: it receives informational responses. {{ServerContext/sendInformational()}} is the server-side counterpart: it sends them.
 
@@ -751,6 +753,8 @@ The <dfn method for="ServerContext">waitUntil(promise)</dfn> method extends the 
 </div>
 
 This is analogous to `ExtendableEvent.waitUntil()` in [Service Workers](https://w3c.github.io/ServiceWorker/) and `ctx.waitUntil()` in Cloudflare Workers.
+
+Unlike the optional features enumerated in [[#conformance]], {{ServerContext/waitUntil()}} MUST be supported by every implementation: applications depend on it for cleanup and logging actions that must complete.
 
 An implementation MAY impose an implementation-defined time limit on how long it will wait for outstanding {{ServerContext/waitUntil()}} promises to settle.
 
@@ -1389,7 +1393,7 @@ QUIC configuration {#serve-quic}
 
 When {{ServerOptions/quic}} is `true` or a {{QUICOptions}} object, the server additionally listens for QUIC connections on the same port and supports HTTP/3.
 
-HTTP/3 requires TLS. If {{ServerOptions/quic}} is enabled and {{ServerOptions/tls}} is not provided, the implementation throws a {{TypeError}}.
+HTTP/3 requires TLS. If {{ServerOptions/quic}} is enabled and {{ServerOptions/tls}} is not provided, the implementation throws a {{TypeError}}. If {{ServerOptions/quic}} is enabled and the implementation does not support QUIC, it throws a `"NotSupportedError"` {{DOMException}} (see [[#conformance]]).
 
 
 Server and Listener {#server-listener}
