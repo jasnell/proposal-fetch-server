@@ -114,6 +114,8 @@ Runtimes have independently arrived at similar patterns:
 
 A single context object avoids positional fragility and extends without signature changes.
 
+The indirection also permits lazy materialization. Because the {{Request}} is reached through an accessor (`ctx.request`), an implementation can defer constructing it &mdash; parsing the URL, materializing the {{Headers}}, allocating the {{AbortSignal}} &mdash; until the handler first accesses it. A handler that denies a request under load never pays for a {{Request}} it never reads. A signature that passes the {{Request}} as an argument forecloses this optimization.
+
 <h4 class="no-num" id="why-not-extend">Why not extend Request and Response?</h4>
 
 Subtyping (`ServerRequest extends Request`) creates structural compatibility questions: which client-specific {{Request}} properties (`.cache`, `.credentials`, `.mode`, `.redirect`, `.destination`) should a server-side subtype expose, and with what values? These properties are meaningless for incoming server requests.
@@ -137,6 +139,7 @@ This proposal defines the [=Fetch Server API=], a server-side HTTP API built on 
 
 *   A {{ServerContext}} interface providing connection metadata, server capabilities, and lifecycle management for incoming HTTP requests.
 *   A {{ConnectContext}} interface extending {{ServerContext}} for CONNECT and extended CONNECT tunnel protocols.
+*   An [=exchange=] state model governing response commitment, and an [=error code=] registry mapping protocol-version-independent codes to HTTP/2 and HTTP/3 error signals.
 *   A {{Tunnel}} interface for bidirectional communication over established HTTP tunnels, including the Capsule Protocol and HTTP Datagrams.
 *   A {{WebTransportSession}} interface for multiplexed streams and datagrams over HTTP connections.
 *   A handler object model with `fetch()` and `connect()` methods for processing requests and tunnels.
@@ -195,6 +198,10 @@ an entity that accepts HTTP connections, receives requests, and sends responses
 
 a JavaScript function provided by the application that processes incoming requests or tunnel establishment attempts
 
+<h3 class="no-toc" id="term-exchange"><dfn export>exchange</dfn></h3>
+
+the server-side processing of a single incoming request or tunnel establishment attempt, from receipt until the response (or tunnel) completes and all lifecycle-extension promises settle
+
 <h3 class="no-toc" id="term-tunnel"><dfn dfn-type="dfn" id="dfn-tunnel">tunnel</dfn></h3>
 
 a long-lived bidirectional communication channel established through an HTTP connection via the CONNECT method or extended CONNECT
@@ -245,11 +252,15 @@ callback PriorityCallback = undefined (optional RequestPriority priority = {});
 callback FetchHandler = any (ServerContext ctx);
 
 callback ConnectHandler = any (ConnectContext ctx);
+
+callback ErrorHandler = any (ServerContext ctx, any error);
 </pre>
 
 The {{FetchHandler}} callback receives a {{ServerContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one of those. The return type is specified as `any` because Web IDL cannot express `(Response or undefined or Promise<Response or undefined>)` as a callback return type.
 
 The {{ConnectHandler}} callback receives a {{ConnectContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one of those.
+
+The {{ErrorHandler}} callback receives the context of a failed [=exchange=] (a {{ServerContext}} or {{ConnectContext}}) and the thrown value, and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one of those. See [[#handler-error]].
 
 Options dictionaries {#idl-options}
 -----------------------------------
@@ -297,6 +308,7 @@ dictionary ListenOptions {
 dictionary HandlerObject {
   required FetchHandler fetch;
   ConnectHandler connect;
+  ErrorHandler error;
 };
 </pre>
 
@@ -309,7 +321,10 @@ interface ServerContext {
   [SameObject] readonly attribute Request request;
 
   readonly attribute SocketAddress remoteAddress;
+  readonly attribute SocketAddress localAddress;
   readonly attribute DOMString alpnProtocol;
+  readonly attribute boolean encrypted;
+  readonly attribute DOMString? serverName;
 
   readonly attribute RequestPriority clientPriority;
   attribute RequestPriority? serverPriority;
@@ -492,6 +507,63 @@ The namespace `FetchServer` is used here for specification purposes. The actual 
 </div>
 
 
+Exchange states {#exchange-states}
+==================================
+
+Each [=exchange=] is in exactly one of five states. The state determines which context operations are valid, and is the foundation for the error model in [[#errors]].
+
+: <dfn export for="exchange">open</dfn>
+:: Nothing has been sent to the client. The initial state.
+: <dfn export for="exchange">informational</dfn>
+:: At least one informational (1xx) response has been sent; no final response has begun.
+: <dfn export for="exchange">committed</dfn>
+:: A final response has begun: the handler returned a {{Response}}, or a tunnel was accepted via {{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}, or {{ConnectContext/upgradeWebTransport()}}.
+: <dfn export for="exchange">denied</dfn>
+:: {{ServerContext/deny()}} was called. Terminal.
+: <dfn export for="exchange">aborted</dfn>
+:: The client reset the stream, or the connection was lost, before the exchange completed. Terminal. The exchange's <dfn export>abort reason</dfn> is a [=protocol error=] describing the cause ([[#errors-inbound]]).
+
+An exchange is <dfn export>response-capable</dfn> while it is [=exchange/open=] or [=exchange/informational=].
+
+<table>
+  <thead>
+    <tr><th>Operation</th><th>[=exchange/open=]</th><th>[=exchange/informational=]</th><th>[=exchange/committed=]</th><th>[=exchange/denied=]</th><th>[=exchange/aborted=]</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>{{ServerContext/sendInformational()}}</td>
+      <td>Allowed &rarr; [=exchange/informational=]</td>
+      <td>Allowed</td>
+      <td>Throws</td>
+      <td>Throws</td>
+      <td>Discarded</td>
+    </tr>
+    <tr>
+      <td>{{ServerContext/deny()}}</td>
+      <td>Allowed &rarr; [=exchange/denied=]</td>
+      <td>Throws</td>
+      <td>Throws</td>
+      <td>Throws</td>
+      <td>Discarded</td>
+    </tr>
+    <tr>
+      <td>{{ConnectContext/accept()}} and the upgrade methods</td>
+      <td>Allowed &rarr; [=exchange/committed=]</td>
+      <td>Allowed &rarr; [=exchange/committed=]</td>
+      <td>Throws</td>
+      <td>Throws</td>
+      <td>Fails with the [=abort reason=]</td>
+    </tr>
+  </tbody>
+</table>
+
+The two failure behaviors are deliberate:
+
+*   **Deterministic misuse throws.** The [=exchange/informational=], [=exchange/committed=], and [=exchange/denied=] states are entered by the handler's own actions, so a violation is a programming error: the operation throws an `"InvalidStateError"` {{DOMException}}.
+*   **Races are inert.** The [=exchange/aborted=] state can be entered by the peer at any moment; a handler cannot reliably check-then-act against it. Synchronous operations are silently discarded rather than throwing. Promise-returning establishment methods reject with the [=abort reason=].
+
+Note: {{ServerContext/deny()}} is restricted to [=exchange/open=] because its default signal (`ERR_HTTP_REQUEST_REJECTED`) is a guarantee to the client that no processing occurred and the request may be safely retried &mdash; even for non-idempotent methods. Once anything has been sent, that guarantee would be false. The state model makes it structurally impossible to send it untruthfully.
+
 ServerContext {#sec-servercontext}
 ==================================
 
@@ -529,7 +601,19 @@ The <dfn attribute for="ServerContext">remoteAddress</dfn> attribute returns the
 </div>
 
 <div algorithm>
+The <dfn attribute for="ServerContext">localAddress</dfn> attribute returns the {{SocketAddress}} of the local endpoint the connection arrived on, identifying the binding when a server listens on multiple addresses or ports. The same availability escape applies as for {{ServerContext/remoteAddress}}.
+</div>
+
+<div algorithm>
 The <dfn attribute for="ServerContext">alpnProtocol</dfn> attribute returns the ALPN protocol identifier negotiated for this connection. Common values are `"http/1.1"`, `"h2"`, and `"h3"`. If ALPN was not negotiated (e.g., plaintext HTTP/1.1), the value is `"http/1.1"`.
+</div>
+
+<div algorithm>
+The <dfn attribute for="ServerContext">encrypted</dfn> attribute returns `true` if the connection is protected by TLS (including QUIC, where TLS is intrinsic), and `false` otherwise. This distinguishes plaintext HTTP/1.1 from HTTP/1.1 over TLS without ALPN, which {{ServerContext/alpnProtocol}} alone cannot.
+</div>
+
+<div algorithm>
+The <dfn attribute for="ServerContext">serverName</dfn> attribute returns the SNI server name from the TLS ClientHello, or `null` if the connection is not encrypted or the client did not send SNI. Unlike the `Host` header, this value is what TLS certificate selection was based on; the two can legitimately differ, which matters for multi-tenant routing.
 </div>
 
 Note: The {{ServerContext/alpnProtocol}} value identifies the HTTP version of the connection. Handlers generally should not branch on this value. It is provided for logging, debugging, and the rare case where application behavior legitimately depends on the transport.
@@ -591,69 +675,61 @@ The <dfn method for="ServerContext">sendInformational(status, headers)</dfn> met
 
 <ol>
 <li>If |status| is not in the range 100&ndash;199 inclusive, throw a {{RangeError}}.
+<li>If the [=exchange=] is [=exchange/committed=] or [=exchange/denied=], throw an `"InvalidStateError"` {{DOMException}}.
+<li>If the [=exchange=] is [=exchange/aborted=], return.
 <li>Construct a headers object from |headers| if provided.
-<li>Send the informational response with status |status| and the constructed headers to the client.
+<li>If a [=pending 100 obligation=] exists, send a `100 Continue` response and clear the obligation.
+<li>Send the informational response with status |status| and the constructed headers. The exchange is now [=exchange/informational=].
 </ol>
 </div>
 
 Notable informational status codes:
 
-*   **100 Continue**: Indicates the server is willing to accept the request body. Typically sent automatically by the implementation when `Expect: 100-continue` is present, but may be sent explicitly.
+*   **100 Continue**: Indicates the server is willing to accept the request body. Sent by the implementation according to the rules below.
 *   **103 Early Hints**: Provides header fields (typically `Link` headers) that the client can use to start preloading resources before the final response ([RFC 8297](https://www.rfc-editor.org/rfc/rfc8297)).
 
 An implementation that does not support informational responses accepts the method call without error and silently discards it.
 
 Note: The Fetch Standard's `onInformation` callback (in `fetch()` options) is the client-side counterpart: it receives informational responses. {{ServerContext/sendInformational()}} is the server-side counterpart: it sends them.
 
+### 100 Continue ### {#servercontext-100-continue}
+
+When a request arrives with `Expect: 100-continue`, the implementation records a <dfn export>pending 100 obligation</dfn> rather than responding immediately. Sending `100 Continue` on arrival would invite the request body before the handler has had the opportunity to {{ServerContext/deny()}} the exchange, defeating the purpose of the `Expect` mechanism.
+
+The obligation resolves at the first of the following events:
+
+<table>
+  <thead>
+    <tr><th>Event</th><th>Disposition</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>The handler begins reading the request body</td><td>Send `100 Continue` &mdash; the server is ready to receive</td></tr>
+    <tr><td>The handler calls {{ServerContext/sendInformational()}}</td><td>Send `100 Continue` first, then the requested response</td></tr>
+    <tr><td>The handler returns a final {{Response}} without reading the body</td><td>Omit, per [RFC 9110 Section 10.1.1](https://www.rfc-editor.org/rfc/rfc9110#section-10.1.1)</td></tr>
+    <tr><td>{{ServerContext/deny()}} is called, or the exchange is [=exchange/aborted=]</td><td>Discard</td></tr>
+  </tbody>
+</table>
+
+Flushing the pending `100 Continue` ahead of any explicit informational response keeps the client's view deterministic: a client waiting on its `Expect` never has to interpret some other 1xx as an implicit answer. Any 1xx from the handler means the exchange is proceeding, so the implementation confirms the body is welcome first.
+
 Denial {#servercontext-denial}
 -------------------------------
 
 <div algorithm>
-The <dfn method for="ServerContext">deny(error)</dfn> method signals that the handler is declining to process the request. The request is not handled &mdash; no {{Response}} is generated. The handler returns `undefined` (or nothing) after calling {{ServerContext/deny()}}.
+The <dfn method for="ServerContext">deny(error)</dfn> method signals that the handler is declining to process the request. No {{Response}} is generated; the handler returns `undefined` (or nothing) after calling {{ServerContext/deny()}}.
 
-At the protocol level, {{ServerContext/deny()}} resets the stream:
-
-*   HTTP/2: `RST_STREAM` with an error code
-*   HTTP/3: `RESET_STREAM` with an error code
-*   HTTP/1.1: Implementation-defined (close the connection, or send a 503 response and close as a pragmatic fallback)
-
-The optional |error| argument controls the protocol-level error code. If the error has a `.code` property, the implementation maps it to the appropriate protocol error code. The following abstract error codes are defined:
+<ol>
+<li>If the [=exchange=] is [=exchange/aborted=], return.
+<li>If the [=exchange=] is not [=exchange/open=], throw an `"InvalidStateError"` {{DOMException}} (see [[#exchange-states]]).
+<li>Set the exchange state to [=exchange/denied=].
+<li>Reset the stream, carrying the protocol error code selected by |error|:
+    *   HTTP/2: `RST_STREAM`
+    *   HTTP/3: `RESET_STREAM`
+    *   HTTP/1.1: Implementation-defined (close the connection, or send a 503 response and close as a pragmatic fallback)
+</ol>
 </div>
 
-<table>
-  <thead>
-    <tr><th>Error code</th><th>Protocol signal</th><th>Meaning</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><dfn export>`ERR_HTTP_REQUEST_REJECTED`</dfn></td>
-      <td>REFUSED_STREAM (HTTP/2), H3_REQUEST_REJECTED (HTTP/3)</td>
-      <td>Not processed. Client may safely retry.</td>
-    </tr>
-    <tr>
-      <td><dfn export>`ERR_HTTP_REQUEST_CANCELLED`</dfn></td>
-      <td>CANCEL (HTTP/2), H3_REQUEST_CANCELLED (HTTP/3)</td>
-      <td>Intentionally cancelled. May have been partially processed.</td>
-    </tr>
-    <tr>
-      <td><dfn export>`ERR_HTTP_INTERNAL_ERROR`</dfn></td>
-      <td>INTERNAL_ERROR (HTTP/2), H3_INTERNAL_ERROR (HTTP/3)</td>
-      <td>Internal error in the server.</td>
-    </tr>
-    <tr>
-      <td><dfn export>`ERR_HTTP_CONNECT_ERROR`</dfn></td>
-      <td>CONNECT_ERROR (HTTP/2), H3_CONNECT_ERROR (HTTP/3)</td>
-      <td>Tunnel-specific error.</td>
-    </tr>
-    <tr>
-      <td><dfn export>`ERR_HTTP_GOAWAY`</dfn></td>
-      <td>GOAWAY frame (HTTP/2), GOAWAY frame (HTTP/3)</td>
-      <td>Close the connection after finishing in-flight streams.</td>
-    </tr>
-  </tbody>
-</table>
-
-When no |error| is provided, or when the error has no `.code` or an unrecognized `.code`, the implementation defaults to REFUSED_STREAM / H3_REQUEST_REJECTED. This is the correct default because {{ServerContext/deny()}} means the request was not processed, which is exactly the semantic REFUSED_STREAM was designed to express. A client receiving this signal knows the request can be safely retried &mdash; including non-idempotent methods like POST.
+If |error| has a `.code` property whose value is an [=error code=] sendable via {{ServerContext/deny()}} (see [[#errors-codes]]), the implementation maps it to the corresponding wire-level code. When |error| is omitted, has no `.code`, or the code is unrecognized, the default is `ERR_HTTP_REQUEST_REJECTED` (REFUSED_STREAM / H3_REQUEST_REJECTED). This is the correct default because {{ServerContext/deny()}} means the request was not processed, which is exactly the semantic REFUSED_STREAM was designed to express. A client receiving this signal knows the request can be safely retried &mdash; including non-idempotent methods like POST.
 
 The `ERR_HTTP_GOAWAY` code is a connection-level signal. Unlike the other codes which reset a single stream, `ERR_HTTP_GOAWAY` instructs the implementation to:
 
@@ -667,8 +743,6 @@ For HTTP/1.1, `ERR_HTTP_GOAWAY` closes the connection after the current exchange
 
 Note: Proactive GOAWAY (shutting down connections without a triggering request) is handled by {{Closeable/close()}} and {{Closeable/destroy()}} in the infrastructure layer, not by {{ServerContext/deny()}}. The {{ServerContext/deny()}} mechanism covers the reactive case where a handler decides during request processing that the connection should be closed.
 
-Note: The error code mapping depends on the [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property), which adds a standardized `.code` property to the `Error` constructor options. If that proposal does not advance, the error code mechanism described here would need an alternative design &mdash; for instance, a dedicated options dictionary rather than an error object.
-
 Request lifecycle {#servercontext-lifecycle}
 --------------------------------------------
 
@@ -679,6 +753,8 @@ The <dfn method for="ServerContext">waitUntil(promise)</dfn> method extends the 
 This is analogous to `ExtendableEvent.waitUntil()` in [Service Workers](https://w3c.github.io/ServiceWorker/) and `ctx.waitUntil()` in Cloudflare Workers.
 
 An implementation MAY impose an implementation-defined time limit on how long it will wait for outstanding {{ServerContext/waitUntil()}} promises to settle.
+
+If a promise passed to {{ServerContext/waitUntil()}} rejects, the implementation reports the rejection in an implementation-defined manner (e.g., logging). The rejection does not affect the response and does not invoke the handler's `error()` method ([[#handler-error]]).
 
 
 ConnectContext {#sec-connectcontext}
@@ -716,6 +792,8 @@ Accepting a tunnel {#connectcontext-accept}
 The <dfn method for="ConnectContext">accept(init)</dfn> method accepts the CONNECT request and establishes a [=tunnel=]. It returns a `Promise<Tunnel>` that resolves when the tunnel is established.
 
 The optional |init| parameter allows setting response headers on the success response.
+
+Accepting commits the [=exchange=] ([=exchange/committed=]): subsequent calls to {{ConnectContext/accept()}}, the upgrade methods, or {{ServerContext/deny()}} throw an `"InvalidStateError"` {{DOMException}}, per [[#exchange-states]]. If the exchange is [=exchange/aborted=], the returned promise rejects with the [=abort reason=]. {{ConnectContext/upgradeWebSocket()}} and {{ConnectContext/upgradeWebTransport()}} are committing operations subject to the same rules.
 </div>
 
 WebSocket upgrade {#connectcontext-websocket}
@@ -812,6 +890,17 @@ On HTTP/2 or HTTP/1.1 connections, datagrams are sent as DATAGRAM capsules (type
 
 Both [CONNECT-UDP](https://www.rfc-editor.org/rfc/rfc9298) and [CONNECT-IP](https://www.rfc-editor.org/rfc/rfc9484) use HTTP Datagrams for their data plane. The {{Tunnel/datagrams()}} API provides the foundation for both.
 
+Closure {#tunnel-closure}
+-------------------------
+
+<div algorithm>
+The <dfn method for="Tunnel">close()</dfn> method closes the [=tunnel=] gracefully.
+</div>
+
+<div algorithm>
+The <dfn attribute for="Tunnel">closed</dfn> attribute returns a promise that resolves when the tunnel is closed cleanly by either peer, and rejects with a [=protocol error=] when the tunnel terminates abnormally &mdash; for example, the peer reset the stream or the connection was lost (see [[#errors-inbound]]).
+</div>
+
 
 WebTransport {#webtransport}
 ============================
@@ -862,6 +951,134 @@ The {{WebTransportSession/transport}} property indicates the underlying transpor
 *   `"capsule"`: Capsule Protocol over a single HTTP/2 data stream. Head-of-line blocking applies. Datagrams are reliable (sent as DATAGRAM capsules).
 
 
+Errors {#errors}
+================
+
+HTTP/2 and HTTP/3 carry typed error signals in both directions: stream resets (`RST_STREAM`, `RESET_STREAM`, `STOP_SENDING`) and connection-level `GOAWAY` frames, each with an error code. This section defines a protocol-version-independent registry of [=error codes=], the shape of the JavaScript errors that carry them, and how they propagate outbound (server to client) and inbound (client to server).
+
+Error codes {#errors-codes}
+---------------------------
+
+An <dfn export>error code</dfn> is a string identifying a protocol-level error condition independently of HTTP version.
+
+<table>
+  <thead>
+    <tr><th>Code</th><th>HTTP/2</th><th>HTTP/3</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><dfn export>`ERR_HTTP_REQUEST_REJECTED`</dfn></td>
+      <td>REFUSED_STREAM</td>
+      <td>H3_REQUEST_REJECTED</td>
+      <td>Not processed. The client may safely retry, including non-idempotent methods.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_REQUEST_CANCELLED`</dfn></td>
+      <td>CANCEL</td>
+      <td>H3_REQUEST_CANCELLED</td>
+      <td>Intentionally cancelled. May have been partially processed.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_INTERNAL_ERROR`</dfn></td>
+      <td>INTERNAL_ERROR</td>
+      <td>H3_INTERNAL_ERROR</td>
+      <td>Internal error in the HTTP stack or application.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_STREAM_RESET`</dfn></td>
+      <td>any other code</td>
+      <td>any other code</td>
+      <td>Generic stream reset; the wire code has no more specific mapping.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_GOAWAY`</dfn></td>
+      <td>GOAWAY frame</td>
+      <td>GOAWAY frame</td>
+      <td>The connection is winding down; no new streams will be accepted.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_PROTOCOL_ERROR`</dfn></td>
+      <td>PROTOCOL_ERROR</td>
+      <td>H3_GENERAL_PROTOCOL_ERROR</td>
+      <td>Framing or protocol violation.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_CONNECT_ERROR`</dfn></td>
+      <td>CONNECT_ERROR</td>
+      <td>H3_CONNECT_ERROR</td>
+      <td>A tunnel was reset or abnormally closed.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_REQUEST_BODY_REJECTED`</dfn></td>
+      <td>RST_STREAM (NO_ERROR) after a complete response</td>
+      <td>STOP_SENDING (H3_NO_ERROR)</td>
+      <td>The server does not want the remainder of the request body; the response is unaffected.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_CONNECTION_RESET`</dfn></td>
+      <td colspan=2>transport-level</td>
+      <td>The underlying connection was lost.</td>
+    </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_TIMEOUT`</dfn></td>
+      <td colspan=2>transport-level</td>
+      <td>An implementation-defined timeout elapsed.</td>
+    </tr>
+  </tbody>
+</table>
+
+Where each code may appear:
+
+*   Sendable via {{ServerContext/deny()}}: `ERR_HTTP_REQUEST_REJECTED` (the default), `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR`, `ERR_HTTP_CONNECT_ERROR`, `ERR_HTTP_GOAWAY`.
+*   Sendable by aborting a committed response ([[#errors-outbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR` (the default).
+*   Sendable by cancelling the request body ([[#errors-outbound]]): `ERR_HTTP_REQUEST_BODY_REJECTED`.
+*   Observable inbound ([[#errors-inbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_STREAM_RESET`, `ERR_HTTP_PROTOCOL_ERROR`, `ERR_HTTP_GOAWAY`, `ERR_HTTP_CONNECT_ERROR`, `ERR_HTTP_CONNECTION_RESET`, `ERR_HTTP_TIMEOUT`.
+
+Note: The registry is deliberately small. Most HTTP/2 and HTTP/3 error codes (`FLOW_CONTROL_ERROR`, `FRAME_SIZE_ERROR`, ...) are protocol plumbing that applications cannot act on; unrecognized wire codes surface as `ERR_HTTP_STREAM_RESET`. The taxonomy is designed to be shared with client-side `fetch()` error reporting, where the same codes describe the same wire events observed from the other end.
+
+Protocol error objects {#errors-objects}
+----------------------------------------
+
+A <dfn export>protocol error</dfn> is a {{TypeError}} with:
+
+*   a `code` own property whose value is an [=error code=]; and
+*   optionally, a `detail` own property whose value is an object of the form `{ protocol, errorCode, errorName }` carrying the raw wire-level information (e.g., `{ protocol: "h2", errorCode: 0x07, errorName: "REFUSED_STREAM" }`).
+
+The `cause` property is not used for protocol metadata; it retains its conventional role of chaining an underlying `Error`.
+
+Note: Constructing errors with a `code` option depends on the [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property), which adds a standardized `code` property to the `Error` constructor options. If that proposal does not advance, `code` remains an own property assigned by the implementation; the observable shape is the same.
+
+Outbound errors {#errors-outbound}
+----------------------------------
+
+A handler signals protocol-level errors to the client through three mechanisms, one per phase of the [=exchange=]:
+
+1.  **Before commitment**: {{ServerContext/deny()}} resets the stream. Valid only while the exchange is [=exchange/open=]. See [[#servercontext-denial]].
+
+2.  **After commitment**: if the {{ReadableStream}} serving as the {{Response}} body errors, the implementation resets the stream. If the erroring value is a [=protocol error=] with a sendable code, that code is mapped to the wire; otherwise `ERR_HTTP_INTERNAL_ERROR` is used. `ERR_HTTP_REQUEST_REJECTED` is not sendable here: its retryability guarantee cannot be honored once bytes have been sent, and the state model keeps it structurally unreachable after commitment.
+
+3.  **Request body refusal**: cancelling the request body's {{ReadableStream}} signals that the server does not want the remainder of the upload &mdash; `STOP_SENDING` on HTTP/3, or `RST_STREAM` with NO_ERROR after a complete response on HTTP/2, per [RFC 9113 Section 8.1](https://www.rfc-editor.org/rfc/rfc9113#section-8.1). The response side of the exchange is unaffected. This is the outbound use of `ERR_HTTP_REQUEST_BODY_REJECTED`.
+
+Inbound errors {#errors-inbound}
+--------------------------------
+
+When the client resets the request stream or the connection is lost, the [=exchange=] becomes [=exchange/aborted=] and the event propagates as a [=protocol error=] &mdash; the exchange's [=abort reason=] &mdash; on every surface the handler may be observing:
+
+<table>
+  <thead>
+    <tr><th>Surface</th><th>Propagation</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>`request.signal`</td><td>Aborted, with the protocol error as the abort reason</td></tr>
+    <tr><td>Reading `request.body`</td><td>The read rejects with the protocol error</td></tr>
+    <tr><td>A streaming {{Response}} body</td><td>The {{ReadableStream}} is cancelled with the protocol error as the reason</td></tr>
+    <tr><td>{{Tunnel/closed}} / {{WebTransportSession/closed}}</td><td>Rejects with the protocol error on abnormal termination</td></tr>
+    <tr><td>Pending {{ConnectContext/accept()}} or upgrade promises</td><td>Reject with the protocol error</td></tr>
+  </tbody>
+</table>
+
+The code distinguishes situations a handler may reasonably treat differently: `ERR_HTTP_REQUEST_CANCELLED` (the client deliberately cancelled), `ERR_HTTP_CONNECTION_RESET` (the connection died), `ERR_HTTP_GOAWAY` (the exchange could not complete before an orderly connection wind-down). Inbound wire codes with no specific mapping surface as `ERR_HTTP_STREAM_RESET`.
+
 Handler model {#handler-model}
 ==============================
 
@@ -872,7 +1089,7 @@ The FetchHandler {#handler-fetch}
 
 The `fetch()` [=handler=] receives a {{ServerContext}} and returns a {{Response}}, `undefined`, or a {{Promise}} resolving to one.
 
-Returning `undefined` is valid only after calling {{ServerContext/deny()}}. If the handler returns `undefined` without having called {{ServerContext/deny()}}, the implementation treats it as a programming error and sends a 500 Internal Server Error response.
+Returning `undefined` is valid only after calling {{ServerContext/deny()}}, or when the [=exchange=] was [=exchange/aborted=]. Any other `undefined` &mdash; or any return value that is not a {{Response}} &mdash; is a programming error: the implementation invokes the `error()` handler ([[#handler-error]]) with a {{TypeError}} describing the invalid return, falling back to 500 Internal Server Error.
 
 ```js
 async fetch(ctx) {
@@ -929,6 +1146,40 @@ async connect(ctx) {
 
 If no `connect()` handler is provided, the implementation responds to CONNECT requests with 501 Not Implemented.
 
+The ErrorHandler {#handler-error}
+---------------------------------
+
+The optional `error()` [=handler=] customizes the response when another handler faults. It receives the same context object the faulting handler received and the thrown value, and may:
+
+*   return a {{Response}} (or a {{Promise}} resolving to one), which is sent;
+*   call {{ServerContext/deny()}} (valid only while the [=exchange=] is [=exchange/open=]) and return `undefined`; or
+*   return `undefined`, falling through to the default: 500 Internal Server Error for `fetch()`, 502 Bad Gateway for `connect()`.
+
+```js
+export default {
+  [Symbol.for('server.protocol')]: 1,
+
+  async fetch(ctx) {
+    return handle(ctx.request);
+  },
+
+  error(ctx, err) {
+    if (err.code === 'ERR_AT_CAPACITY') {
+      ctx.deny();  // REFUSED_STREAM — client may retry elsewhere
+      return;
+    }
+    return new Response('Internal Error', { status: 500 });
+  },
+};
+```
+
+`error()` is invoked only while the exchange is [=response-capable=]: a `fetch()` or `connect()` handler threw, returned a rejected promise, or returned an invalid value before committing. It is not invoked for:
+
+*   faults after commitment &mdash; the response or tunnel is aborted instead ([[#errors-outbound]]);
+*   exchanges already [=exchange/denied=] or [=exchange/aborted=] &mdash; there is nothing to respond to;
+*   rejected {{ServerContext/waitUntil()}} promises &mdash; those are reported by the implementation;
+*   faults in `error()` itself &mdash; there is no re-entry; the default response is sent.
+
 Error handling {#handler-errors}
 --------------------------------
 
@@ -937,15 +1188,19 @@ Error handling {#handler-errors}
     <tr><th>Condition</th><th>Behavior</th></tr>
   </thead>
   <tbody>
-    <tr><td>Handler calls {{ServerContext/deny()}}, returns undefined</td><td>Stream reset (per error code)</td></tr>
+    <tr><td>Handler calls {{ServerContext/deny()}}, returns `undefined`</td><td>Stream reset (per [=error code=])</td></tr>
     <tr><td>Handler calls {{ServerContext/deny()}} with `ERR_HTTP_GOAWAY`</td><td>Stream reset + GOAWAY on the connection</td></tr>
-    <tr><td>`fetch()` handler returns a {{Response}}</td><td>That response is sent</td></tr>
-    <tr><td>`fetch()` handler throws</td><td>500 Internal Server Error</td></tr>
-    <tr><td>`fetch()` handler returns rejected promise</td><td>500 Internal Server Error</td></tr>
-    <tr><td>`connect()` handler returns a {{Response}}</td><td>That response is sent</td></tr>
-    <tr><td>`connect()` handler returns `undefined`</td><td>Tunnel accepted (via accept/upgrade)</td></tr>
-    <tr><td>`connect()` handler throws</td><td>502 Bad Gateway</td></tr>
-    <tr><td>`connect()` handler returns rejected promise</td><td>502 Bad Gateway</td></tr>
+    <tr><td>`fetch()` returns a {{Response}}</td><td>That response is sent</td></tr>
+    <tr><td>`fetch()` throws or rejects while [=response-capable=]</td><td>`error()` is invoked; fallback 500</td></tr>
+    <tr><td>`fetch()` returns an invalid value</td><td>`error()` is invoked with a {{TypeError}}; fallback 500</td></tr>
+    <tr><td>`fetch()` throws or rejects after commitment</td><td>Response stream aborted; `ERR_HTTP_INTERNAL_ERROR`</td></tr>
+    <tr><td>`connect()` returns a {{Response}} before accepting</td><td>That response is sent</td></tr>
+    <tr><td>`connect()` returns `undefined` after accept or deny</td><td>Normal completion</td></tr>
+    <tr><td>`connect()` throws or rejects while [=response-capable=]</td><td>`error()` is invoked; fallback 502</td></tr>
+    <tr><td>`connect()` throws or rejects after accepting</td><td>Tunnel aborted; `ERR_HTTP_CONNECT_ERROR`</td></tr>
+    <tr><td>`error()` throws, rejects, or returns an invalid value</td><td>Default 500/502; no re-entry</td></tr>
+    <tr><td>[=Exchange=] is [=exchange/aborted=] (client gone)</td><td>Handler outcome discarded; `error()` not invoked</td></tr>
+    <tr><td>{{ServerContext/waitUntil()}} promise rejects</td><td>Reported by the implementation; response unaffected</td></tr>
   </tbody>
 </table>
 
@@ -1339,9 +1594,9 @@ For server-side handlers, full-duplex is implicit: the handler can begin writing
 Typed stream resets and error codes {#open-typed-resets}
 -------------------------------------------------------
 
-HTTP/2 RST_STREAM and HTTP/3 RESET_STREAM/STOP_SENDING frames carry error codes. `AbortSignal.reason` provides an arbitrary JavaScript value but has no mapping to protocol-level error codes.
+This specification defines the server-side half of typed error signaling: the [=error code=] registry, outbound signaling via {{ServerContext/deny()}} and stream aborts, and inbound propagation as [=protocol errors=] ([[#errors]]).
 
-The {{ServerContext/deny()}} method addresses one direction of this problem: a server sending a typed stream reset to a client. The same taxonomy applies in the other direction: when a client receives a stream reset from a server, the error code should be surfaced on the resulting {{TypeError}}. The [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property) would enable this.
+The client-side half remains open. When a `fetch()` call observes a stream reset, the Fetch Standard currently collapses it into a bare {{TypeError}}. Surfacing the same [=error codes=] there &mdash; on the rejection, and on errors of the response body stream &mdash; requires changes to the Fetch Standard's network error concept, and benefits from the [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property) for a standardized `code` constructor option. The registry in [[#errors-codes]] is designed to be shared by both sides.
 
 ServerResponse {#open-server-response}
 --------------------------------------
