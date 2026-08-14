@@ -298,6 +298,7 @@ dictionary ServerOptions {
   DOMString hostname;
   TLSOptions tls;
   (boolean or QUICOptions) quic = false;
+  boolean autoContinue = true;
   AbortSignal signal;
 };
 
@@ -333,6 +334,7 @@ interface ServerContext {
   attribute RequestPriority? serverPriority;
   attribute PriorityCallback? onpriority;
 
+  readonly attribute boolean autoContinue;
   undefined sendInformational(unsigned short status,
                               optional HeadersInit headers);
 
@@ -550,6 +552,14 @@ An exchange is <dfn export>response-capable</dfn> while it is [=exchange/open=] 
       <td>Discarded</td>
     </tr>
     <tr>
+      <td>{{ServerContext/deny()}} with the [=fall-through sentinel=]</td>
+      <td>Allowed (remains [=exchange/open=]; rerouted to `fetch()`)</td>
+      <td>Throws</td>
+      <td>Throws</td>
+      <td>Throws</td>
+      <td>Discarded</td>
+    </tr>
+    <tr>
       <td>{{ConnectContext/accept()}} and the upgrade methods</td>
       <td>Allowed &rarr; [=exchange/committed=]</td>
       <td>Allowed &rarr; [=exchange/committed=]</td>
@@ -676,14 +686,22 @@ The <dfn method for="ServerContext">sendInformational(status, headers)</dfn> met
 
 <ol>
 <li>If the implementation does not support informational responses, throw a `"NotSupportedError"` {{DOMException}}.
-<li>If |status| is not in the range 100&ndash;199 inclusive, throw a {{RangeError}}.
+<li>If |status| is `101`, or is not in the range 100&ndash;199 inclusive, throw a {{RangeError}}.
 <li>If the [=exchange=] is [=exchange/committed=] or [=exchange/denied=], throw an `"InvalidStateError"` {{DOMException}}.
 <li>If the [=exchange=] is [=exchange/aborted=], return.
+<li>If |status| is `100`:
+    <ol>
+    <li>If no [=pending 100 obligation=] exists, throw an `"InvalidStateError"` {{DOMException}}.
+    <li>Construct a headers object from |headers| if provided, send a `100 Continue` response with those headers, and clear the obligation. The exchange is now [=exchange/informational=].
+    <li>Return.
+    </ol>
 <li>Construct a headers object from |headers| if provided.
-<li>If a [=pending 100 obligation=] exists, send a `100 Continue` response and clear the obligation.
+<li>If {{ServerContext/autoContinue}} is `true` and a [=pending 100 obligation=] exists, send a `100 Continue` response and clear the obligation.
 <li>Send the informational response with status |status| and the constructed headers. The exchange is now [=exchange/informational=].
 </ol>
 </div>
+
+Status `101 (Switching Protocols)` is categorically rejected: protocol upgrades are handled through the `connect()` handler, where {{ConnectContext/accept()}} performs the handshake on the application's behalf ([[#connectcontext-upgrade]]). A `101` is also unrepresentable in HTTP/2 and HTTP/3 ([RFC 9113 Section 8.6](https://www.rfc-editor.org/rfc/rfc9113#section-8.6)), so permitting it would leak an HTTP/1.1 wire artifact through the version-transparent handler model.
 
 Notable informational status codes:
 
@@ -698,21 +716,32 @@ Note: The Fetch Standard's `onInformation` callback (in `fetch()` options) is th
 
 When a request arrives with `Expect: 100-continue`, the implementation records a <dfn export>pending 100 obligation</dfn> rather than responding immediately. Sending `100 Continue` on arrival would invite the request body before the handler has had the opportunity to {{ServerContext/deny()}} the exchange, defeating the purpose of the `Expect` mechanism.
 
-The obligation resolves at the first of the following events:
+<div algorithm>
+The <dfn attribute for="ServerContext">autoContinue</dfn> attribute returns `true` if the implementation resolves the [=pending 100 obligation=] automatically, and `false` if sending the `100 Continue` is the application's responsibility. In the infrastructure layer the value is configured via {{ServerOptions/autoContinue}} (default `true`). In runtimes without the infrastructure layer, the value is determined by the runtime &mdash; platform policy, a compatibility flag, or similar external mechanism &mdash; and this attribute is how the application discovers it.
+</div>
+
+An explicit `sendInformational(100)` call is valid if and only if a [=pending 100 obligation=] exists, in both modes; it sends the `100 Continue` (with the caller's headers) and clears the obligation. Calling it when no obligation exists &mdash; the request carried no `Expect: 100-continue`, or a `100 Continue` was already sent &mdash; throws an `"InvalidStateError"` {{DOMException}}: an unsolicited or duplicate `100 Continue` is always a programming error. ([RFC 9110 Section 15.2.1](https://www.rfc-editor.org/rfc/rfc9110#section-15.2.1) merely has clients discard such interim responses; this API rejects them loudly rather than emitting meaningless ones.)
+
+The obligation otherwise resolves at the first of the following events:
 
 <table>
   <thead>
-    <tr><th>Event</th><th>Disposition</th></tr>
+    <tr><th>Event</th><th>{{ServerContext/autoContinue}} is `true`</th><th>{{ServerContext/autoContinue}} is `false`</th></tr>
   </thead>
   <tbody>
-    <tr><td>The handler begins reading the request body</td><td>Send `100 Continue` &mdash; the server is ready to receive</td></tr>
-    <tr><td>The handler calls {{ServerContext/sendInformational()}}</td><td>Send `100 Continue` first, then the requested response</td></tr>
-    <tr><td>The handler returns a final {{Response}} without reading the body</td><td>Omit, per [RFC 9110 Section 10.1.1](https://www.rfc-editor.org/rfc/rfc9110#section-10.1.1)</td></tr>
-    <tr><td>{{ServerContext/deny()}} is called, or the exchange is [=exchange/aborted=]</td><td>Discard</td></tr>
+    <tr><td>The handler calls `sendInformational(100)`</td><td colspan=2>Send `100 Continue` with the caller's headers; clear the obligation</td></tr>
+    <tr><td>The handler sends another 1xx via {{ServerContext/sendInformational()}}</td><td>Send `100 Continue` first, then the requested response</td><td>Send only the requested response</td></tr>
+    <tr><td>The handler begins reading the request body</td><td>Send `100 Continue` &mdash; the server is ready to receive</td><td>Nothing is sent</td></tr>
+    <tr><td>The handler returns a final {{Response}} without reading the body</td><td colspan=2>Omit, per [RFC 9110 Section 10.1.1](https://www.rfc-editor.org/rfc/rfc9110#section-10.1.1)</td></tr>
+    <tr><td>{{ServerContext/deny()}} is called, or the exchange is [=exchange/aborted=]</td><td colspan=2>Discard</td></tr>
   </tbody>
 </table>
 
-Flushing the pending `100 Continue` ahead of any explicit informational response keeps the client's view deterministic: a client waiting on its `Expect` never has to interpret some other 1xx as an implicit answer. Any 1xx from the handler means the exchange is proceeding, so the implementation confirms the body is welcome first.
+An automatically sent `100 Continue` transitions the exchange to [=exchange/informational=], exactly as an explicit informational response does: bytes have been sent, so {{ServerContext/deny()}} is no longer available.
+
+Flushing the pending `100 Continue` ahead of any other explicit informational response keeps the client's view deterministic: a client waiting on its `Expect` never has to interpret some other 1xx as an implicit answer. Any 1xx from the handler means the exchange is proceeding, so the implementation confirms the body is welcome first.
+
+Note: When {{ServerContext/autoContinue}} is `false`, reading the request body without having sent the `100 Continue` can stall: clients typically wait for the `100` before transmitting content, though [RFC 9110 Section 10.1.1](https://www.rfc-editor.org/rfc/rfc9110#section-10.1.1) advises them not to wait indefinitely. Liveness is the application's responsibility. What manual mode buys is finer control &mdash; for example, sending `103 Early Hints` while authorization is still deciding, without committing to receive the body.
 
 Denial {#servercontext-denial}
 -------------------------------
@@ -723,6 +752,12 @@ The <dfn method for="ServerContext">deny(error)</dfn> method signals that the ha
 <ol>
 <li>If the [=exchange=] is [=exchange/aborted=], return.
 <li>If the [=exchange=] is not [=exchange/open=], throw an `"InvalidStateError"` {{DOMException}} (see [[#exchange-states]]).
+<li>If |error| is the [=fall-through sentinel=]:
+    <ol>
+    <li>If the exchange is not [=upgrade-originated=], throw an `"InvalidStateError"` {{DOMException}}.
+    <li>Mark the exchange as falling through to `fetch()`. The exchange remains [=exchange/open=] and nothing is sent. This context becomes inert: subsequent calls to {{ConnectContext/accept()}}, the upgrade methods, or {{ServerContext/deny()}} throw an `"InvalidStateError"` {{DOMException}}. See [[#connectcontext-fallthrough]].
+    <li>Return.
+    </ol>
 <li>Set the exchange state to [=exchange/denied=].
 <li>Reset the stream, carrying the protocol error code selected by |error|:
     *   HTTP/2: `RST_STREAM`
@@ -730,6 +765,8 @@ The <dfn method for="ServerContext">deny(error)</dfn> method signals that the ha
     *   HTTP/1.1: Implementation-defined (close the connection, or send a 503 response and close as a pragmatic fallback)
 </ol>
 </div>
+
+{{ServerContext/deny()}} is terminal for the handler: the only valid completion after calling it is `undefined` (or a promise resolving to `undefined`). The handler may perform additional work before returning &mdash; the exchange is not complete until the handler's promise and all {{ServerContext/waitUntil()}} promises settle &mdash; but no response is expected, and resolving with any other value is an invalid return ([[#handler-errors]]).
 
 If |error| has a `.code` property whose value is an [=error code=] sendable via {{ServerContext/deny()}} (see [[#errors-codes]]), the implementation maps it to the corresponding wire-level code. When |error| is omitted, has no `.code`, or the code is unrecognized, the default is `ERR_HTTP_REQUEST_REJECTED` (REFUSED_STREAM / H3_REQUEST_REJECTED). This is the correct default because {{ServerContext/deny()}} means the request was not processed, which is exactly the semantic REFUSED_STREAM was designed to express. A client receiving this signal knows the request can be safely retried &mdash; including non-idempotent methods like POST.
 
@@ -783,11 +820,19 @@ The <dfn attribute for="ConnectContext">connectProtocol</dfn> attribute returns 
 HTTP/1.1 upgrade normalization {#connectcontext-upgrade}
 ---------------------------------------------------------
 
-HTTP/1.1 WebSocket connections use the `Upgrade: websocket` mechanism rather than extended CONNECT. To provide a unified handler model, an implementation normalizes HTTP/1.1 WebSocket upgrade requests into {{ConnectContext}} objects with {{ConnectContext/connectProtocol}} set to `"websocket"`.
+HTTP/1.1 uses the `Upgrade` header field ([RFC 9110 Section 7.8](https://www.rfc-editor.org/rfc/rfc9110#section-7.8)) rather than extended CONNECT. To provide a unified handler model, an implementation normalizes HTTP/1.1 upgrade requests into {{ConnectContext}} objects: when an HTTP/1.1 request is received with `Upgrade` and `Connection: Upgrade` header fields, the implementation constructs a {{ConnectContext}} with {{ConnectContext/connectProtocol}} set to the first protocol token of the `Upgrade` field value and the {{ServerContext/request}} preserving the original method, headers, and URL. Such an exchange is <dfn export>upgrade-originated</dfn>. (The full, preference-ordered token list remains available via the request's `Upgrade` header.)
 
-When an HTTP/1.1 request is received with `GET`, `Upgrade: websocket`, and `Connection: Upgrade`, the implementation constructs a {{ConnectContext}} with {{ConnectContext/connectProtocol}} set to `"websocket"` and the {{ServerContext/request}} preserving the original headers and URL.
+For WebSocket (`GET` with `Upgrade: websocket`), this means WebSocket handling is in one place &mdash; the `connect()` handler &mdash; regardless of HTTP version.
 
-This normalization means WebSocket handling is in one place regardless of HTTP version.
+On an [=upgrade-originated=] exchange, {{ConnectContext/accept()}} performs the HTTP/1.1 upgrade handshake: it sends a `101 (Switching Protocols)` response with an `Upgrade` header field echoing {{ConnectContext/connectProtocol}}, and the resulting {{Tunnel}}'s {{Tunnel/readable}} and {{Tunnel/writable}} expose the raw connection bytes. As with extended CONNECT, the application never sends the `101` itself; the handshake is the implementation's concern ([[#servercontext-informational]]).
+
+### Routing ### {#connectcontext-upgrade-routing}
+
+*   If a `connect()` handler is provided, [=upgrade-originated=] exchanges are routed to it. The handler completes the upgrade ({{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}), refuses it (a non-2xx {{Response}}, or {{ServerContext/deny()}}), or declines only the upgrade offer via the [=fall-through sentinel=] ([[#connectcontext-fallthrough]]).
+*   If no `connect()` handler is provided, the upgrade offer is ignored, as [RFC 9110 Section 7.8](https://www.rfc-editor.org/rfc/rfc9110#section-7.8) permits: the request is routed to `fetch()` as an ordinary request. The `Upgrade` header remains visible there, but the handler cannot act on it.
+*   An implementation MAY instead handle particular upgrade protocols itself, without routing them to the application.
+
+Note: This differs from CONNECT and extended CONNECT, which have no ordinary-request interpretation; those are answered with 501 Not Implemented when no `connect()` handler is provided.
 
 Accepting a tunnel {#connectcontext-accept}
 -------------------------------------------
@@ -798,6 +843,8 @@ The <dfn method for="ConnectContext">accept(init)</dfn> method accepts the CONNE
 The optional |init| parameter allows setting response headers on the success response.
 
 Accepting commits the [=exchange=] ([=exchange/committed=]): subsequent calls to {{ConnectContext/accept()}}, the upgrade methods, or {{ServerContext/deny()}} throw an `"InvalidStateError"` {{DOMException}}, per [[#exchange-states]]. If the exchange is [=exchange/aborted=], the returned promise rejects with the [=abort reason=]. {{ConnectContext/upgradeWebSocket()}} and {{ConnectContext/upgradeWebTransport()}} are committing operations subject to the same rules.
+
+On [=upgrade-originated=] exchanges, accepting performs the HTTP/1.1 upgrade handshake instead of a CONNECT success response; see [[#connectcontext-upgrade]].
 </div>
 
 WebSocket upgrade {#connectcontext-websocket}
@@ -821,7 +868,7 @@ If {{ConnectContext/connectProtocol}} is not `"webtransport"`, this method throw
 Denying a tunnel {#connectcontext-deny}
 ---------------------------------------
 
-A `connect()` handler can deny a tunnel in two ways:
+A `connect()` handler can refuse a tunnel outright in two ways:
 
 **Protocol-level denial** via {{ServerContext/deny()}} (inherited from {{ServerContext}}). This resets the stream without sending an HTTP response:
 
@@ -841,6 +888,37 @@ async connect(ctx) {
 ```
 
 The choice depends on the intended signal: {{ServerContext/deny()}} says "I never processed this" (protocol-level); a {{Response}} says "I processed this and the answer is no" (application-level).
+
+On [=upgrade-originated=] exchanges there is a third option: declining only the upgrade offer while letting the request proceed as ordinary HTTP. See [[#connectcontext-fallthrough]].
+
+Upgrade fall-through {#connectcontext-fallthrough}
+--------------------------------------------------
+
+Calling {{ServerContext/deny()}} with the <dfn export>fall-through sentinel</dfn> &mdash; `Symbol.for('server.fallthrough')` &mdash; denies the [=tunnel=] without denying the carrying request. The upgrade offer is treated as ignored, and the request proceeds to `fetch()` as ordinary HTTP:
+
+```js
+async connect(ctx) {
+  if (ctx.connectProtocol === 'websocket' && !wsEnabled) {
+    ctx.deny(Symbol.for('server.fallthrough'));
+    return;  // fetch() takes it from here
+  }
+  const ws = ctx.upgradeWebSocket();
+  // ...
+}
+```
+
+The sentinel is a registered symbol, following the same pattern as the [=protocol marker=]: it costs no allocation, cannot collide with an application's error objects, and is not an [=error code=] &mdash; nothing is sent on the wire.
+
+The sentinel is valid only on [=upgrade-originated=] exchanges. An HTTP/1.1 request bearing `Upgrade` is an ordinary request carrying an opportunistic offer that a server may ignore ([RFC 9110 Section 7.8](https://www.rfc-editor.org/rfc/rfc9110#section-7.8)); CONNECT and extended CONNECT requests have no such interpretation &mdash; the request *is* the tunnel &mdash; so the sentinel on those exchanges throws an `"InvalidStateError"` {{DOMException}}.
+
+After the `connect()` invocation settles with `undefined`, the implementation invokes `fetch()` with a fresh {{ServerContext}} for the same [=exchange=]:
+
+*   Nothing has been sent and the exchange is still [=exchange/open=], so the `fetch()` handler retains its full capabilities &mdash; including {{ServerContext/deny()}}, honestly, since no processing is visible to the client.
+*   The {{ServerContext/request}} is the same {{Request}}, `Upgrade` header intact.
+*   {{ServerContext/waitUntil()}} registrations and any [=pending 100 obligation=] carry over.
+*   `fetch()` has no fall-through of its own; the flow terminates there.
+
+`fetch()` is not invoked until the `connect()` invocation settles, so it is in the application's interest to return promptly after calling {{ServerContext/deny()}} with the sentinel &mdash; {{ServerContext/waitUntil()}} is the tool for anything slow. If the invocation rejects, or resolves with anything other than `undefined`, the fault takes precedence: the exchange is still [=response-capable=], so the standard fault path applies ([[#handler-errors]]) and `fetch()` is not invoked.
 
 
 Tunnel {#sec-tunnel}
@@ -1119,7 +1197,7 @@ The ConnectHandler {#handler-connect}
 
 The `connect()` [=handler=] receives a {{ConnectContext}} and:
 
-*   Returns `undefined` if the tunnel has been accepted or denied via {{ServerContext/deny()}}.
+*   Returns `undefined` if the tunnel has been accepted, denied via {{ServerContext/deny()}}, or fallen through via the [=fall-through sentinel=].
 *   Returns a {{Response}} to deny the request at the application level.
 *   Throws or returns a rejected promise, causing a 502 Bad Gateway response.
 
@@ -1194,6 +1272,9 @@ Error handling {#handler-errors}
   <tbody>
     <tr><td>Handler calls {{ServerContext/deny()}}, returns `undefined`</td><td>Stream reset (per [=error code=])</td></tr>
     <tr><td>Handler calls {{ServerContext/deny()}} with `ERR_HTTP_GOAWAY`</td><td>Stream reset + GOAWAY on the connection</td></tr>
+    <tr><td>Handler resolves with a non-`undefined` value after {{ServerContext/deny()}}</td><td>Invalid return: reported; nothing is sent; `error()` not invoked</td></tr>
+    <tr><td>`connect()` calls {{ServerContext/deny()}} with the [=fall-through sentinel=], settles with `undefined`</td><td>`fetch()` is invoked for the same exchange</td></tr>
+    <tr><td>`connect()` rejects or resolves with a non-`undefined` value after the [=fall-through sentinel=]</td><td>`error()` is invoked; fallback 502; `fetch()` not invoked</td></tr>
     <tr><td>`fetch()` returns a {{Response}}</td><td>That response is sent</td></tr>
     <tr><td>`fetch()` throws or rejects while [=response-capable=]</td><td>`error()` is invoked; fallback 500</td></tr>
     <tr><td>`fetch()` returns an invalid value</td><td>`error()` is invoked with a {{TypeError}}; fallback 500</td></tr>
@@ -1342,6 +1423,8 @@ ServerOptions {#serve-options}
 ------------------------------
 
 When {{ServerOptions/port}} is `0`, the operating system assigns an available port. When {{ServerOptions/hostname}} is omitted but {{ServerOptions/port}} is provided, the default bind address is `"0.0.0.0"`.
+
+The {{ServerOptions/autoContinue}} member controls automatic handling of `Expect: 100-continue` requests; see [[#servercontext-100-continue]]. The configured value is exposed to handlers via {{ServerContext/autoContinue}}.
 
 TLS configuration {#serve-tls}
 ------------------------------
