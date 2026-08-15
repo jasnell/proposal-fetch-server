@@ -1640,8 +1640,14 @@ The {{Closeable}} mixin provides a uniform lifecycle interface shared by {{Serve
 ### busy ### {#closeable-busy}
 
 <div algorithm>
-When <dfn attribute for="Closeable">busy</dfn> is `true`, new requests are not dispatched to handlers. In-flight requests continue to be processed.
+When <dfn attribute for="Closeable">busy</dfn> is `true`, new [=exchanges=] are refused as if by {{ServerContext/deny()}} with no |error| argument: no handler is invoked, and the exchange is refused with the default [=error code=] &mdash; `ERR_HTTP_REQUEST_REJECTED`, i.e. REFUSED_STREAM on HTTP/2 and H3_REQUEST_REJECTED on HTTP/3. On HTTP/1.1, the implementation MAY respond with a 503 (Service Unavailable) &mdash; optionally carrying a `Retry-After` header field &mdash; without closing the connection, since the condition is temporary. In-flight exchanges continue to be processed, and outstanding {{ServerContext/waitUntil()}} promises are unaffected.
 </div>
+
+The refusal applies uniformly to all exchange kinds &mdash; request/response, CONNECT, and [=upgrade-originated=] alike &mdash; since no handler runs to distinguish them. Because no handler is invoked, no context (and, per [[#why-context]], no {{Request}}) need ever be materialized for a refused exchange.
+
+Setting {{Closeable/busy}} does not wind down connections: no GOAWAY is sent, and connections remain open so that requests are accepted again the moment the attribute returns to `false`. Connection wind-down is the domain of {{Closeable/close()}}, {{Closeable/destroy()}}, and per-request denial with `ERR_HTTP_GOAWAY`.
+
+Note: {{Closeable/busy}} deliberately reuses {{ServerContext/deny()}}'s default semantics because they state exactly what a temporarily busy server wants to communicate: nothing was processed, and the client may safely retry &mdash; including non-idempotent requests. HTTP/2's ENHANCE_YOUR_CALM (0x0b) and HTTP/3's H3_EXCESSIVE_LOAD (0x0107) are deliberately not used: those codes signal that the <em>peer</em> is generating suspicious or excessive load &mdash; an accusation of client misbehavior, not a statement of the server's own unavailability.
 
 Note: {{Closeable/busy}} is intended for brief back-pressure scenarios such as waiting for a downstream dependency to recover, performing a configuration reload, or coordinating with a load balancer during a rolling deploy. For permanent shutdown, use {{Closeable/close()}}.
 
