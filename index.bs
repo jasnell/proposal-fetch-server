@@ -377,7 +377,7 @@ interface Tunnel {
 };
 </pre>
 
-The {{Tunnel}} interface represents an established [=tunnel=] through an HTTP connection.
+The {{Tunnel}} interface represents an established [=tunnel=] through an HTTP connection. It supports `Symbol.asyncDispose`, enabling `await using` declarations; see [[#tunnel-closure]].
 
 The CapsuleStream dictionary {#idl-capsulestream}
 -------------------------------------------------
@@ -972,6 +972,29 @@ The <dfn method for="Tunnel">close()</dfn> method closes the [=tunnel=] graceful
 <div algorithm>
 The <dfn attribute for="Tunnel">closed</dfn> attribute returns a promise that resolves when the tunnel is closed cleanly by either peer, and rejects with a [=protocol error=] when the tunnel terminates abnormally &mdash; for example, the peer reset the stream or the connection was lost (see [[#errors-inbound]]).
 </div>
+
+<div algorithm="Tunnel async disposal">
+{{Tunnel}} supports `Symbol.asyncDispose`, enabling `await using` declarations. The disposal steps are:
+
+<ol>
+<li>If the tunnel is already closed or has already terminated abnormally, return a promise resolved with `undefined`. Disposal does not re-surface an error the application has already had the opportunity to observe via {{Tunnel/closed}}.
+<li>Otherwise, call {{Tunnel/close()}} and return a promise that settles as closure completes: fulfilled on clean closure, or rejected with the [=protocol error=] if the tunnel terminates abnormally while closing.
+</ol>
+</div>
+
+```js
+async connect(ctx) {
+  if (ctx.connectProtocol !== 'connect-udp') {
+    return new Response(null, { status: 501 });
+  }
+  await using tunnel = await ctx.accept();
+  await proxyUdpPayloads(tunnel.datagrams());
+  // Scope exit closes the tunnel and awaits closure —
+  // including on early return or throw.
+}
+```
+
+Note: There is no `Symbol.dispose`: tunnel closure is inherently asynchronous, so {{Tunnel}} supports `await using` but not synchronous `using`.
 
 
 WebTransport {#webtransport}
