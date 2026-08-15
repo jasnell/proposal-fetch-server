@@ -965,12 +965,48 @@ Both [CONNECT-UDP](https://www.rfc-editor.org/rfc/rfc9298) and [CONNECT-IP](http
 Closure {#tunnel-closure}
 -------------------------
 
+Tunnel closure is a property of the tunnel's two directions. Each direction completes independently through the Streams API, and the tunnel closes gracefully when both have completed &mdash; no call to {{Tunnel/close()}} is required.
+
+<table>
+  <thead>
+    <tr><th>Stream event</th><th>Tunnel effect</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>{{Tunnel/writable}} is closed via the Streams API</td>
+      <td>Local half-close: pending data is flushed, then the end of the send direction is signaled (END_STREAM on HTTP/2, stream FIN on HTTP/3, TCP half-close for HTTP/1.1 CONNECT)</td>
+    </tr>
+    <tr>
+      <td>The peer half-closes its send direction</td>
+      <td>Remote half-close: {{Tunnel/readable}} closes after delivering any remaining data</td>
+    </tr>
+    <tr>
+      <td>Both directions have completed</td>
+      <td>The tunnel is closed; {{Tunnel/closed}} resolves</td>
+    </tr>
+    <tr>
+      <td>{{Tunnel/writable}} is aborted, or {{Tunnel/readable}} is cancelled</td>
+      <td>Abnormal termination: the stream is reset carrying the [=error code=] mapped from the abort or cancel reason, defaulting to `ERR_HTTP_CONNECT_ERROR` ([[#errors-outbound]]); the other constituent stream errors; {{Tunnel/closed}} rejects</td>
+    </tr>
+    <tr>
+      <td>The peer resets the stream, or the connection is lost</td>
+      <td>Abnormal termination: both constituent streams error with the [=protocol error=] ([[#errors-inbound]]); {{Tunnel/closed}} rejects</td>
+    </tr>
+  </tbody>
+</table>
+
+Closure is wire-level, not consumption-level: the tunnel is closed once its send direction has been flushed and ended and the peer's end-of-stream has been received. {{Tunnel/closed}} can therefore resolve while {{Tunnel/readable}} still holds undrained data; the application may continue reading after closure.
+
+Half-closes are graceful; aborts are terminal. A lone half-close leaves the opposite direction fully operational &mdash; a tunnel can finish sending while continuing to receive, and vice versa. Cancelling or aborting either constituent stream terminates the entire tunnel.
+
+When the application has switched to the Capsule Protocol via {{Tunnel/capsules()}}, the active {{CapsuleStream}} pair carries these semantics in place of {{Tunnel/readable}} and {{Tunnel/writable}}; closing the capsule writable ends the send direction after the final capsule. {{DatagramStream}} pairs do not participate in closure: datagrams have no end-of-stream concept, closing a datagram writable stops local sends without any wire signal, and tunnel closure closes (or errors) the datagram streams rather than the reverse.
+
 <div algorithm>
-The <dfn method for="Tunnel">close()</dfn> method closes the [=tunnel=] gracefully.
+The <dfn method for="Tunnel">close()</dfn> method closes the [=tunnel=] gracefully, expressed in stream terms: it closes {{Tunnel/writable}} (a local half-close). It does not cancel {{Tunnel/readable}} &mdash; graceful closure does not discard the peer's in-flight data. Full closure, and settlement of {{Tunnel/closed}}, arrives when the peer completes its direction. An application that does not want the remaining inbound data can cancel {{Tunnel/readable}} instead, at the cost of abnormal termination.
 </div>
 
 <div algorithm>
-The <dfn attribute for="Tunnel">closed</dfn> attribute returns a promise that resolves when the tunnel is closed cleanly by either peer, and rejects with a [=protocol error=] when the tunnel terminates abnormally &mdash; for example, the peer reset the stream or the connection was lost (see [[#errors-inbound]]).
+The <dfn attribute for="Tunnel">closed</dfn> attribute returns a promise that resolves when the tunnel is closed cleanly, and rejects with a [=protocol error=] when the tunnel terminates abnormally &mdash; for example, the peer reset the stream or the connection was lost (see [[#errors-inbound]]).
 </div>
 
 <div algorithm="Tunnel async disposal">
@@ -1131,6 +1167,7 @@ Where each code may appear:
 *   Sendable via {{ServerContext/deny()}}: `ERR_HTTP_REQUEST_REJECTED` (the default), `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR`, `ERR_HTTP_CONNECT_ERROR`, `ERR_HTTP_GOAWAY`.
 *   Sendable by aborting a committed response ([[#errors-outbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR` (the default).
 *   Sendable by cancelling the request body ([[#errors-outbound]]): `ERR_HTTP_REQUEST_BODY_REJECTED`.
+*   Sendable by aborting a [=tunnel=]'s constituent streams ([[#errors-outbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR`, `ERR_HTTP_CONNECT_ERROR` (the default).
 *   Observable inbound ([[#errors-inbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_STREAM_RESET`, `ERR_HTTP_PROTOCOL_ERROR`, `ERR_HTTP_GOAWAY`, `ERR_HTTP_CONNECT_ERROR`, `ERR_HTTP_CONNECTION_RESET`, `ERR_HTTP_TIMEOUT`.
 
 Note: The registry is deliberately small. Most HTTP/2 and HTTP/3 error codes (`FLOW_CONTROL_ERROR`, `FRAME_SIZE_ERROR`, ...) are protocol plumbing that applications cannot act on; unrecognized wire codes surface as `ERR_HTTP_STREAM_RESET`. The taxonomy is designed to be shared with client-side `fetch()` error reporting, where the same codes describe the same wire events observed from the other end.
@@ -1150,13 +1187,15 @@ Note: Constructing errors with a `code` option depends on the [TC39 Error Code p
 Outbound errors {#errors-outbound}
 ----------------------------------
 
-A handler signals protocol-level errors to the client through three mechanisms, one per phase of the [=exchange=]:
+A handler signals protocol-level errors to the client through four mechanisms:
 
 1.  **Before commitment**: {{ServerContext/deny()}} resets the stream. Valid only while the exchange is [=exchange/open=]. See [[#servercontext-denial]].
 
 2.  **After commitment**: if the {{ReadableStream}} serving as the {{Response}} body errors, the implementation resets the stream. If the erroring value is a [=protocol error=] with a sendable code, that code is mapped to the wire; otherwise `ERR_HTTP_INTERNAL_ERROR` is used. `ERR_HTTP_REQUEST_REJECTED` is not sendable here: its retryability guarantee cannot be honored once bytes have been sent, and the state model keeps it structurally unreachable after commitment.
 
 3.  **Request body refusal**: cancelling the request body's {{ReadableStream}} signals that the server does not want the remainder of the upload &mdash; `STOP_SENDING` on HTTP/3, or `RST_STREAM` with NO_ERROR after a complete response on HTTP/2, per [RFC 9113 Section 8.1](https://www.rfc-editor.org/rfc/rfc9113#section-8.1). The response side of the exchange is unaffected. This is the outbound use of `ERR_HTTP_REQUEST_BODY_REJECTED`.
+
+4.  **Tunnel abort**: aborting either constituent stream of an established [=tunnel=] &mdash; its writable via abort, or its readable via cancel &mdash; terminates the tunnel abnormally and resets the stream. If the abort or cancel reason is a [=protocol error=] with a sendable code, that code is mapped to the wire; otherwise `ERR_HTTP_CONNECT_ERROR` is used. See [[#tunnel-closure]].
 
 Inbound errors {#errors-inbound}
 --------------------------------
@@ -1172,6 +1211,7 @@ When the client resets the request stream or the connection is lost, the [=excha
     <tr><td>Reading `request.body`</td><td>The read rejects with the protocol error</td></tr>
     <tr><td>A streaming {{Response}} body</td><td>The {{ReadableStream}} is cancelled with the protocol error as the reason</td></tr>
     <tr><td>{{Tunnel/closed}} / {{WebTransportSession/closed}}</td><td>Rejects with the protocol error on abnormal termination</td></tr>
+    <tr><td>A [=tunnel=]'s constituent streams</td><td>The readable errors, and pending or subsequent writes to the writable reject, with the protocol error</td></tr>
     <tr><td>Pending {{ConnectContext/accept()}} or upgrade promises</td><td>Reject with the protocol error</td></tr>
   </tbody>
 </table>
@@ -1701,6 +1741,11 @@ Typed stream resets and error codes {#open-typed-resets}
 This specification defines the server-side half of typed error signaling: the [=error code=] registry, outbound signaling via {{ServerContext/deny()}} and stream aborts, and inbound propagation as [=protocol errors=] ([[#errors]]).
 
 The client-side half remains open. When a `fetch()` call observes a stream reset, the Fetch Standard currently collapses it into a bare {{TypeError}}. Surfacing the same [=error codes=] there &mdash; on the rejection, and on errors of the response body stream &mdash; requires changes to the Fetch Standard's network error concept, and benefits from the [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property) for a standardized `code` constructor option. The registry in [[#errors-codes]] is designed to be shared by both sides.
+
+Activity timeouts {#open-timeouts}
+----------------------------------
+
+Graceful [=tunnel=] closure waits for the peer: after a local half-close, {{Tunnel/closed}} (and any `await using` disposal) settles only when the peer completes its direction. Activity and idle timeouts &mdash; for tunnels, request/response exchanges, and other long-lived constructs in this specification &mdash; are deliberately not yet specified and will be addressed separately.
 
 ServerResponse {#open-server-response}
 --------------------------------------
