@@ -373,6 +373,7 @@ interface Tunnel {
   DatagramStream datagrams();
 
   undefined close();
+  undefined destroy(optional any error);
   readonly attribute Promise&lt;undefined> closed;
 };
 </pre>
@@ -439,10 +440,13 @@ interface WebTransportSession {
   undefined close(optional WebTransportCloseInfo closeInfo = {});
   readonly attribute Promise&lt;WebTransportCloseInfo> closed;
   readonly attribute Promise&lt;undefined> draining;
+
+  /* server-side extension; not part of the WebTransport API */
+  undefined destroy(optional any error);
 };
 </pre>
 
-The {{WebTransportSession}} interface represents an established WebTransport session, providing multiplexed streams and datagrams over an HTTP connection. It is the server-side counterpart of the [[WEBTRANSPORT]] `WebTransport` interface, and strictly follows that specification's types: {{WebTransportDatagramDuplexStream}}, {{WebTransportBidirectionalStream}}, {{WebTransportSendStream}}, {{WebTransportReceiveStream}}, {{WebTransportSendStreamOptions}}, {{WebTransportCloseInfo}}, and {{WebTransportReliabilityMode}} are the interfaces, dictionaries, and enumerations defined by [[WEBTRANSPORT]]; this specification does not duplicate them. Each member of {{WebTransportSession}} has the semantics of the like-named member of the `WebTransport` interface, adapted to the server side of the session.
+The {{WebTransportSession}} interface represents an established WebTransport session, providing multiplexed streams and datagrams over an HTTP connection. It is the server-side counterpart of the [[WEBTRANSPORT]] `WebTransport` interface, and strictly follows that specification's types: {{WebTransportDatagramDuplexStream}}, {{WebTransportBidirectionalStream}}, {{WebTransportSendStream}}, {{WebTransportReceiveStream}}, {{WebTransportSendStreamOptions}}, {{WebTransportCloseInfo}}, and {{WebTransportReliabilityMode}} are the interfaces, dictionaries, and enumerations defined by [[WEBTRANSPORT]]; this specification does not duplicate them. Each member of {{WebTransportSession}} has the semantics of the like-named member of the `WebTransport` interface, adapted to the server side of the session. The exceptions are explicitly labeled <dfn export>server-side extensions</dfn> &mdash; {{WebTransportSession/destroy()}} and `Symbol.asyncDispose` &mdash; which have no `WebTransport` counterpart and are defined by this specification ([[#webtransport-lifecycle]]). Should [[WEBTRANSPORT]] later define equivalent members, this specification defers to those definitions.
 
 Note: {{WebTransportSession}} deliberately omits the client-only surface of the `WebTransport` interface (the constructor, connection options, certificate hashes, `getStats()`, and pooling-related members). Additional members may be adopted as the server-side profile matures.
 
@@ -997,12 +1001,25 @@ Tunnel closure is a property of the tunnel's two directions. Each direction comp
 
 Closure is wire-level, not consumption-level: the tunnel is closed once its send direction has been flushed and ended and the peer's end-of-stream has been received. {{Tunnel/closed}} can therefore resolve while {{Tunnel/readable}} still holds undrained data; the application may continue reading after closure.
 
-Half-closes are graceful; aborts are terminal. A lone half-close leaves the opposite direction fully operational &mdash; a tunnel can finish sending while continuing to receive, and vice versa. Cancelling or aborting either constituent stream terminates the entire tunnel.
+Half-closes are graceful; aborts are terminal. A lone half-close leaves the opposite direction fully operational &mdash; a tunnel can finish sending while continuing to receive, and vice versa. Cancelling or aborting either constituent stream &mdash; or calling {{Tunnel/destroy()}} &mdash; terminates the entire tunnel.
 
 When the application has switched to the Capsule Protocol via {{Tunnel/capsules()}}, the active {{CapsuleStream}} pair carries these semantics in place of {{Tunnel/readable}} and {{Tunnel/writable}}; closing the capsule writable ends the send direction after the final capsule. {{DatagramStream}} pairs do not participate in closure: datagrams have no end-of-stream concept, closing a datagram writable stops local sends without any wire signal, and tunnel closure closes (or errors) the datagram streams rather than the reverse.
 
 <div algorithm>
 The <dfn method for="Tunnel">close()</dfn> method closes the [=tunnel=] gracefully, expressed in stream terms: it closes {{Tunnel/writable}} (a local half-close). It does not cancel {{Tunnel/readable}} &mdash; graceful closure does not discard the peer's in-flight data. Full closure, and settlement of {{Tunnel/closed}}, arrives when the peer completes its direction. An application that does not want the remaining inbound data can cancel {{Tunnel/readable}} instead, at the cost of abnormal termination.
+</div>
+
+<div algorithm>
+The <dfn method for="Tunnel">destroy(error)</dfn> method immediately terminates the [=tunnel=] without draining:
+
+<ol>
+<li>If the tunnel is already closed or has already terminated abnormally, return.
+<li>Reset the stream, carrying the [=error code=] mapped from |error| per the tunnel abort mechanism ([[#errors-outbound]]); when |error| is omitted or carries no sendable code, `ERR_HTTP_CONNECT_ERROR` is used.
+<li>Error the active constituent pair (raw or {{CapsuleStream}}) and any {{DatagramStream}} streams; pending writes reject.
+<li>Reject {{Tunnel/closed}} with |error| if provided, or with a [=protocol error=] whose code is `ERR_HTTP_CONNECT_ERROR` otherwise.
+</ol>
+
+{{Tunnel/destroy()}} operates on the tunnel rather than through its streams: it remains effective when the constituent streams are locked (e.g., mid-pipe) or the raw pair has been superseded by {{Tunnel/capsules()}}. Called while a graceful {{Tunnel/close()}} is pending, it short-circuits the drain &mdash; destroy wins.
 </div>
 
 <div algorithm>
@@ -1084,6 +1101,39 @@ The {{WebTransportSession/reliability}} attribute (a {{WebTransportReliabilityMo
 *   `"reliable-only"`: Capsule Protocol over a single HTTP/2 data stream. Head-of-line blocking applies. Datagrams are delivered reliably as DATAGRAM capsules.
 
 Because {{ConnectContext/upgradeWebTransport()}} resolves only once the session is established, the `"pending"` value is never observed on a {{WebTransportSession}}.
+
+Lifecycle {#webtransport-lifecycle}
+-----------------------------------
+
+Two [=server-side extensions=] supplement the [[WEBTRANSPORT]] lifecycle members, mirroring {{Tunnel}}.
+
+<div algorithm>
+The <dfn method for="WebTransportSession">destroy(error)</dfn> method immediately terminates the session without a clean close signal:
+
+<ol>
+<li>If the session is already closed or has already terminated abnormally, return.
+<li>Reset the session's underlying CONNECT stream, carrying the [=error code=] mapped from |error| per the tunnel abort mechanism ([[#errors-outbound]]); when |error| is omitted or carries no sendable code, `ERR_HTTP_CONNECT_ERROR` is used. No clean session-close signal is sent.
+<li>Error all of the session's streams &mdash; bidirectional, unidirectional, and datagram &mdash; and reject any pending stream-creation promises.
+<li>Reject {{WebTransportSession/closed}} with |error| if provided, or with a [=protocol error=] whose code is `ERR_HTTP_CONNECT_ERROR` otherwise.
+</ol>
+
+Where {{WebTransportSession/close()}} performs the clean termination defined by [[WEBTRANSPORT]] &mdash; the peer's `closed` promise resolves with the {{WebTransportCloseInfo}} &mdash; {{WebTransportSession/destroy()}} is the abrupt one: the peer observes abnormal session termination, which the WebTransport API already defines as a `closed` rejection. Like {{Tunnel/destroy()}}, it operates on the session rather than through its streams, remains effective when streams are locked, and short-circuits a pending clean close.
+</div>
+
+{{WebTransportSession}} supports `Symbol.asyncDispose`, enabling `await using` declarations, with the same disposal steps as {{Tunnel}}: if the session is already closed or has terminated abnormally, the disposal promise resolves with `undefined`; otherwise {{WebTransportSession/close()}} is called with a default {{WebTransportCloseInfo}} and the promise settles as termination completes &mdash; fulfilled on clean closure, rejected if termination goes abnormal while closing. As with {{Tunnel}}, there is no `Symbol.dispose`.
+
+```js
+async connect(ctx) {
+  if (ctx.connectProtocol !== 'webtransport') {
+    return new Response(null, { status: 501 });
+  }
+  await using session = await ctx.upgradeWebTransport();
+  for await (const stream of session.incomingBidirectionalStreams) {
+    handleStream(stream);
+  }
+  // Scope exit performs a clean close and awaits termination.
+}
+```
 
 
 Errors {#errors}
@@ -1195,7 +1245,7 @@ A handler signals protocol-level errors to the client through four mechanisms:
 
 3.  **Request body refusal**: cancelling the request body's {{ReadableStream}} signals that the server does not want the remainder of the upload &mdash; `STOP_SENDING` on HTTP/3, or `RST_STREAM` with NO_ERROR after a complete response on HTTP/2, per [RFC 9113 Section 8.1](https://www.rfc-editor.org/rfc/rfc9113#section-8.1). The response side of the exchange is unaffected. This is the outbound use of `ERR_HTTP_REQUEST_BODY_REJECTED`.
 
-4.  **Tunnel abort**: aborting either constituent stream of an established [=tunnel=] &mdash; its writable via abort, or its readable via cancel &mdash; terminates the tunnel abnormally and resets the stream. If the abort or cancel reason is a [=protocol error=] with a sendable code, that code is mapped to the wire; otherwise `ERR_HTTP_CONNECT_ERROR` is used. See [[#tunnel-closure]].
+4.  **Tunnel abort**: aborting either constituent stream of an established [=tunnel=] &mdash; its writable via abort, or its readable via cancel &mdash; or calling {{Tunnel/destroy()}} terminates the tunnel abnormally and resets the stream. If the abort, cancel, or destroy reason is a [=protocol error=] with a sendable code, that code is mapped to the wire; otherwise `ERR_HTTP_CONNECT_ERROR` is used. See [[#tunnel-closure]]. {{WebTransportSession/destroy()}} terminates a WebTransport session the same way, by resetting its CONNECT stream ([[#webtransport-lifecycle]]).
 
 Inbound errors {#errors-inbound}
 --------------------------------
@@ -1610,7 +1660,7 @@ Closing a listener does not close the server. Other listeners remain active.
 ### destroy() ### {#closeable-destroy}
 
 <div algorithm>
-The <dfn method for="Closeable">destroy(error)</dfn> method immediately terminates without draining.
+The <dfn method for="Closeable">destroy(error)</dfn> method immediately terminates without draining. The {{Closeable/closed}} promise rejects with |error|, or with an `"AbortError"` {{DOMException}} when no |error| is provided: abrupt termination aborts in-flight work, and {{Closeable/closed}} must remain distinguishable from the graceful completion signaled by {{Closeable/close()}}.
 </div>
 
 <table>
@@ -1622,7 +1672,7 @@ The <dfn method for="Closeable">destroy(error)</dfn> method immediately terminat
     <tr><td>GOAWAY sent</td><td>Yes</td><td>No</td></tr>
     <tr><td>In-flight requests</td><td>Allowed to complete</td><td>Aborted immediately</td></tr>
     <tr><td>`waitUntil()` promises</td><td>Allowed to settle</td><td>Ignored</td></tr>
-    <tr><td>{{Closeable/closed}} promise</td><td>Resolves</td><td>Rejects (if error)</td></tr>
+    <tr><td>{{Closeable/closed}} promise</td><td>Resolves</td><td>Rejects (destroy reason, or `"AbortError"`)</td></tr>
     <tr><td>Returns</td><td>Promise (async)</td><td>undefined (sync)</td></tr>
   </tbody>
 </table>
@@ -1630,7 +1680,7 @@ The <dfn method for="Closeable">destroy(error)</dfn> method immediately terminat
 ### closed ### {#closeable-closed}
 
 <div algorithm>
-The <dfn attribute for="Closeable">closed</dfn> attribute returns a promise that resolves when the server or listener is fully closed.
+The <dfn attribute for="Closeable">closed</dfn> attribute returns a promise that resolves when the server or listener is fully closed after a graceful {{Closeable/close()}}, and rejects &mdash; with the destroy reason, or an `"AbortError"` {{DOMException}} if none was given &mdash; when terminated via {{Closeable/destroy()}}.
 </div>
 
 ### Symbol.asyncDispose ### {#closeable-dispose}
