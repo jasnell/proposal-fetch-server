@@ -289,12 +289,23 @@ dictionary TLSOptions : TLSCertificate {
 dictionary QUICOptions {
 };
 
+dictionary TimeoutOptions {
+  unsigned long long handshake;
+  unsigned long long idle;
+  unsigned long long headers;
+  unsigned long long receive;
+  unsigned long long send;
+  unsigned long long tunnelIdle;
+  unsigned long long waitUntil;
+};
+
 dictionary ServerOptions {
   unsigned short port;
   DOMString hostname;
   TLSOptions tls;
   (boolean or QUICOptions) quic = false;
   boolean autoContinue = true;
+  TimeoutOptions timeouts;
   AbortSignal signal;
 };
 
@@ -303,6 +314,7 @@ dictionary ListenOptions {
   DOMString hostname = "0.0.0.0";
   TLSOptions tls;
   (boolean or QUICOptions) quic;
+  TimeoutOptions timeouts;
 };
 
 dictionary HandlerObject {
@@ -789,7 +801,7 @@ This is analogous to `ExtendableEvent.waitUntil()` in [Service Workers](https://
 
 Unlike the optional features enumerated in [[#conformance]], {{ServerContext/waitUntil()}} MUST be supported by every implementation: applications depend on it for cleanup and logging actions that must complete.
 
-An implementation MAY impose an implementation-defined time limit on how long it will wait for outstanding {{ServerContext/waitUntil()}} promises to settle.
+An implementation MAY impose an implementation-defined time limit on how long it will wait for outstanding {{ServerContext/waitUntil()}} promises to settle. In the infrastructure layer, this limit is configurable via the {{TimeoutOptions/waitUntil}} member of {{TimeoutOptions}} ([[#serve-timeouts]]).
 
 If a promise passed to {{ServerContext/waitUntil()}} rejects, the implementation reports the rejection in an implementation-defined manner (e.g., logging). The rejection does not affect the response and does not invoke the handler's `error()` method ([[#handler-error]]).
 
@@ -1008,7 +1020,7 @@ Half-closes are graceful; aborts are terminal. A lone half-close leaves the oppo
 When the application has switched to the Capsule Protocol via {{Tunnel/capsules()}}, the active {{CapsuleStream}} pair carries these semantics in place of {{Tunnel/readable}} and {{Tunnel/writable}}; closing the capsule writable ends the send direction after the final capsule. {{DatagramStream}} pairs do not participate in closure: datagrams have no end-of-stream concept, closing a datagram writable stops local sends without any wire signal, and tunnel closure closes (or errors) the datagram streams rather than the reverse.
 
 <div algorithm>
-The <dfn method for="Tunnel">close()</dfn> method closes the [=tunnel=] gracefully, expressed in stream terms: it closes {{Tunnel/writable}} (a local half-close). It does not cancel {{Tunnel/readable}} &mdash; graceful closure does not discard the peer's in-flight data. Full closure, and settlement of {{Tunnel/closed}}, arrives when the peer completes its direction. An application that does not want the remaining inbound data can cancel {{Tunnel/readable}} instead, at the cost of abnormal termination.
+The <dfn method for="Tunnel">close()</dfn> method closes the [=tunnel=] gracefully, expressed in stream terms: it closes {{Tunnel/writable}} (a local half-close). It does not cancel {{Tunnel/readable}} &mdash; graceful closure does not discard the peer's in-flight data. Full closure, and settlement of {{Tunnel/closed}}, arrives when the peer completes its direction. An application that does not want the remaining inbound data can cancel {{Tunnel/readable}} instead, at the cost of abnormal termination. A peer that never completes its direction is subject to the {{TimeoutOptions/tunnelIdle}} timeout ([[#serve-timeouts]]).
 </div>
 
 <div algorithm>
@@ -1209,7 +1221,7 @@ An <dfn export>error code</dfn> is a string identifying a protocol-level error c
     <tr>
       <td><dfn export>`ERR_HTTP_TIMEOUT`</dfn></td>
       <td colspan=2>transport-level</td>
-      <td>An implementation-defined timeout elapsed.</td>
+      <td>An implementation-defined or configured ([[#serve-timeouts]]) timeout elapsed.</td>
     </tr>
   </tbody>
 </table>
@@ -1587,6 +1599,73 @@ When {{ServerOptions/quic}} is `true` or a {{QUICOptions}} object, the server ad
 
 HTTP/3 requires TLS. If {{ServerOptions/quic}} is enabled and {{ServerOptions/tls}} is not provided, the implementation throws a {{TypeError}}. If {{ServerOptions/quic}} is enabled and the implementation does not support QUIC, it throws a `"NotSupportedError"` {{DOMException}} (see [[#conformance]]).
 
+Timeouts {#serve-timeouts}
+--------------------------
+
+Activity timeouts are configured through the {{ServerOptions/timeouts}} member of {{ServerOptions}}. A {{ListenOptions/timeouts}} member on {{ListenOptions}} overrides the server-level configuration member-wise for that binding. All values are in milliseconds. An explicit `0` disables the timeout; an absent member leaves the value implementation-defined.
+
+<table>
+  <thead>
+    <tr><th>Member</th><th>Scope</th><th>The clock runs while&hellip;</th><th>On expiry</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>{{TimeoutOptions/handshake}}</td>
+      <td>connection</td>
+      <td>TLS or connection setup is incomplete</td>
+      <td>Close the connection</td>
+    </tr>
+    <tr>
+      <td>{{TimeoutOptions/idle}}</td>
+      <td>connection</td>
+      <td>No active [=exchanges=] exist and no frames are being exchanged</td>
+      <td>GOAWAY and close (HTTP/1.1: close the keep-alive connection; QUIC: maps to the negotiated idle timeout)</td>
+    </tr>
+    <tr>
+      <td>{{TimeoutOptions/headers}}</td>
+      <td>exchange</td>
+      <td>The request head is incomplete</td>
+      <td>HTTP/1.1: 408 (Request Timeout) and close. HTTP/2 and HTTP/3: an implementation-defined stream or connection error &mdash; a complete head usually arrives in a single frame, so this is chiefly an HTTP/1.1 (slowloris) defense</td>
+    </tr>
+    <tr>
+      <td>{{TimeoutOptions/receive}}</td>
+      <td>exchange</td>
+      <td>The exchange is awaiting client data it needs &mdash; a body read is pending upstream</td>
+      <td>Abort the exchange: [=exchange/aborted=], with a [=protocol error=] whose code is `ERR_HTTP_TIMEOUT` propagating through the surfaces in [[#errors-inbound]]</td>
+    </tr>
+    <tr>
+      <td>{{TimeoutOptions/send}}</td>
+      <td>exchange</td>
+      <td>Response data is queued and is not being accepted by the transport</td>
+      <td>Same as {{TimeoutOptions/receive}}</td>
+    </tr>
+    <tr>
+      <td>{{TimeoutOptions/tunnelIdle}}</td>
+      <td>tunnel / session</td>
+      <td>An established [=tunnel=] or {{WebTransportSession}} has no data flowing in either direction</td>
+      <td>{{Tunnel/destroy()}} (or {{WebTransportSession/destroy()}}) with a [=protocol error=] whose code is `ERR_HTTP_TIMEOUT`</td>
+    </tr>
+    <tr>
+      <td>{{TimeoutOptions/waitUntil}}</td>
+      <td>exchange</td>
+      <td>{{ServerContext/waitUntil()}} promises remain unsettled after the response has completed</td>
+      <td>Stop waiting; report outstanding rejections; the exchange completes</td>
+    </tr>
+  </tbody>
+</table>
+
+Two principles govern every member:
+
+*   **Activity, not duration.** Each clock measures the absence of progress and resets when progress occurs. No timeout in this specification caps the total duration of an exchange or tunnel &mdash; total-duration caps break streaming responses, large uploads, and long-lived tunnels by design. A consequence worth stating plainly: a slow <em>handler</em> never trips {{TimeoutOptions/receive}} or {{TimeoutOptions/send}}; those clocks run only while the peer owes progress. Defenses against deliberately slow trickle traffic (minimum-rate enforcement) are implementation latitude.
+
+*   **Expiry is existing machinery.** Exchange-level expiry produces the [=exchange/aborted=] state with a typed [=protocol error=], flowing through the same surfaces as any inbound termination; tunnel expiry is {{Tunnel/destroy()}}; connection expiry is the GOAWAY path. The `error()` handler is never invoked for a timeout &mdash; timeouts are not handler faults.
+
+On the wire, a stream reset caused by {{TimeoutOptions/receive}} or {{TimeoutOptions/send}} expiry carries CANCEL (HTTP/2) or H3_REQUEST_CANCELLED (HTTP/3), while the JavaScript-observable [=protocol error=] carries `ERR_HTTP_TIMEOUT`: the wire says the request is no longer wanted; the API says why.
+
+Implementations SHOULD enable {{TimeoutOptions/handshake}}, {{TimeoutOptions/idle}}, and {{TimeoutOptions/headers}} by default with implementation-defined values &mdash; they are connection hygiene. {{TimeoutOptions/tunnelIdle}} SHOULD be disabled by default: a quiet WebSocket or WebTransport session is legitimate, and keepalive traffic (ping/pong frames, session keepalives) counts as activity, so deployments that enable it compose with standard liveness practice.
+
+Note: Runtimes that do not implement the infrastructure layer determine timeout behavior externally, as with the other members of {{ServerOptions}} (see [[#conformance]]).
+
 
 Server and Listener {#server-listener}
 ======================================
@@ -1799,11 +1878,6 @@ Typed stream resets and error codes {#open-typed-resets}
 This specification defines the server-side half of typed error signaling: the [=error code=] registry, outbound signaling via {{ServerContext/deny()}} and stream aborts, and inbound propagation as [=protocol errors=] ([[#errors]]).
 
 The client-side half remains open. When a `fetch()` call observes a stream reset, the Fetch Standard currently collapses it into a bare {{TypeError}}. Surfacing the same [=error codes=] there &mdash; on the rejection, and on errors of the response body stream &mdash; requires changes to the Fetch Standard's network error concept, and benefits from the [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property) for a standardized `code` constructor option. The registry in [[#errors-codes]] is designed to be shared by both sides.
-
-Activity timeouts {#open-timeouts}
-----------------------------------
-
-Graceful [=tunnel=] closure waits for the peer: after a local half-close, {{Tunnel/closed}} (and any `await using` disposal) settles only when the peer completes its direction. Activity and idle timeouts &mdash; for tunnels, request/response exchanges, and other long-lived constructs in this specification &mdash; are deliberately not yet specified and will be addressed separately.
 
 ServerResponse {#open-server-response}
 --------------------------------------
