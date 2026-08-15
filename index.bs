@@ -30,6 +30,17 @@ spec:dom; type:dfn; for:AbortSignal; text:aborted
 spec:dom; type:dfn; text:aborted flag
 spec:dom; type:dfn; text:signal abort
 </pre>
+<pre class=biblio>
+{
+  "SYMBOL-NAMING": {
+    "authors": ["James M Snell"],
+    "href": "https://proposal-symbol-naming.jasnell.me/",
+    "title": "WinterTC Registered Symbol Naming Convention",
+    "publisher": "Ecma TC55 (WinterTC)",
+    "status": "Draft Proposal"
+  }
+}
+</pre>
 
 <div class="warning">
 This document is <strong>not yet an official WinterTC draft</strong>. It is an individual proposal intended to be submitted to ECMA TC55 (WinterTC) for consideration. It has not been adopted, endorsed, or reviewed by the committee. The content may change substantially before or during that process.
@@ -218,7 +229,7 @@ the value of the `:protocol` pseudo-header in an extended CONNECT request, ident
 
 <h3 class="no-toc" id="term-protocol-marker"><dfn>protocol marker</dfn></h3>
 
-a `Symbol.for('server.protocol')` property on a [=handler=] object with an integer version value, used by the runtime to distinguish this API from legacy invocation conventions
+a `Symbol.for('wintertc.server.protocol')` property on a [=handler=] object with an integer version value, used by the runtime to distinguish this API from legacy invocation conventions. The key follows the [[SYMBOL-NAMING]] convention.
 
 
 Web IDL definitions {#idl}
@@ -950,12 +961,12 @@ On [=upgrade-originated=] exchanges there is a third option: declining only the 
 Upgrade fall-through {#connectcontext-fallthrough}
 --------------------------------------------------
 
-Calling {{ServerContext/deny()}} with the <dfn export>fall-through sentinel</dfn> &mdash; `Symbol.for('server.fallthrough')` &mdash; denies the [=tunnel=] without denying the carrying request. The upgrade offer is treated as ignored, and the request proceeds to `fetch()` as ordinary HTTP:
+Calling {{ServerContext/deny()}} with the <dfn export>fall-through sentinel</dfn> &mdash; `Symbol.for('wintertc.server.fallthrough')` &mdash; denies the [=tunnel=] without denying the carrying request. The upgrade offer is treated as ignored, and the request proceeds to `fetch()` as ordinary HTTP:
 
 ```js
 async connect(ctx) {
   if (ctx.connectProtocol === 'websocket' && !wsEnabled) {
-    ctx.deny(Symbol.for('server.fallthrough'));
+    ctx.deny(Symbol.for('wintertc.server.fallthrough'));
     return;  // fetch() takes it from here
   }
   const ws = ctx.upgradeWebSocket();
@@ -963,7 +974,7 @@ async connect(ctx) {
 }
 ```
 
-The sentinel is a registered symbol, following the same pattern as the [=protocol marker=]: it costs no allocation, cannot collide with an application's error objects, and is not an [=error code=] &mdash; nothing is sent on the wire.
+The sentinel is a registered symbol following the [[SYMBOL-NAMING]] convention, the same pattern as the [=protocol marker=]: it costs no allocation, cannot collide with an application's error objects, and is not an [=error code=] &mdash; nothing is sent on the wire.
 
 The sentinel is valid only on [=upgrade-originated=] exchanges. An HTTP/1.1 request bearing `Upgrade` is an ordinary request carrying an opportunistic offer that a server may ignore ([RFC 9110 Section 7.8](https://www.rfc-editor.org/rfc/rfc9110#section-7.8)); CONNECT and extended CONNECT requests have no such interpretation &mdash; the request *is* the tunnel &mdash; so the sentinel on those exchanges throws an `"InvalidStateError"` {{DOMException}}.
 
@@ -1416,7 +1427,7 @@ The optional `error()` [=handler=] customizes the response when another handler 
 
 ```js
 export default {
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
 
   async fetch(ctx) {
     return handle(ctx.request);
@@ -1473,7 +1484,7 @@ Handlers are provided as an object with `fetch` and/or `connect` methods:
 
 ```js
 const handler = {
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
 
   fetch(ctx) {
     return new Response("Hello");
@@ -1490,7 +1501,7 @@ When the handler is an object with methods, `this` inside the handler refers to 
 
 ```js
 const app = {
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
   db: createPool(process.env.DATABASE_URL),
 
   async fetch(ctx) {
@@ -1511,11 +1522,11 @@ Declarative export and protocol identification {#handler-declarative}
 
 As an alternative to the imperative `serve()` call, an application may export a default handler object. Because existing runtimes already use `export default { fetch() {} }` with different handler signatures (e.g., Cloudflare Workers passes `(Request, Env, ExecutionContext)`, Deno passes `(Request, ServeHandlerInfo)`), a handler object includes a [=protocol marker=] so the runtime can distinguish this API from legacy invocation conventions.
 
-The marker is a `Symbol.for('server.protocol')` property with an integer version value:
+The marker is a `Symbol.for('wintertc.server.protocol')` property with an integer version value:
 
 ```js
 export default {
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
 
   async fetch(ctx) {
     return new Response("Hello");
@@ -1532,11 +1543,11 @@ export default {
 };
 ```
 
-A conforming runtime that supports declarative export checks for the presence and value of `Symbol.for('server.protocol')` on the default export before invoking handler methods:
+A conforming runtime that supports declarative export checks for the presence and value of `Symbol.for('wintertc.server.protocol')` on the default export before invoking handler methods:
 
-*   If `Symbol.for('server.protocol')` is present and its value is `1`, the runtime invokes `fetch()` with a {{ServerContext}} and `connect()` with a {{ConnectContext}}.
-*   If `Symbol.for('server.protocol')` is absent, the runtime invokes handler methods using its existing (legacy) calling convention. Existing application code continues to work without modification.
-*   If `Symbol.for('server.protocol')` is present but its value is not a recognized version, the runtime rejects the handler with a descriptive error.
+*   If `Symbol.for('wintertc.server.protocol')` is present and its value is `1`, the runtime invokes `fetch()` with a {{ServerContext}} and `connect()` with a {{ConnectContext}}.
+*   If `Symbol.for('wintertc.server.protocol')` is absent, the runtime invokes handler methods using its existing (legacy) calling convention. Existing application code continues to work without modification.
+*   If `Symbol.for('wintertc.server.protocol')` is present but its value is not a recognized version, the runtime rejects the handler with a descriptive error.
 
 The version number allows the protocol to evolve. This specification defines version `1`. Future revisions that change handler signatures would increment the version.
 
@@ -1544,7 +1555,7 @@ The **handler object** is the portable unit. The same handler object works with 
 
 ```js
 const handler = {
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
   fetch(ctx) { return new Response("Hello"); },
 };
 
@@ -1569,7 +1580,7 @@ The <dfn method for="FetchServer">serve(handler, options)</dfn> function creates
 ```js
 // One-step: create and listen
 const server = serve({
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
   fetch(ctx) {
     return new Response("Hello");
   },
@@ -1585,7 +1596,7 @@ const server = serve({
 
 // Two-step: create then listen
 const server = serve({
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
   fetch(ctx) {
     return new Response("Hello");
   },
@@ -2057,7 +2068,7 @@ A `socket()` method is added to the handler object:
 
 ```js
 export default {
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
   fetch(ctx) { /* HTTP request/response */ },
   connect(ctx) { /* HTTP tunnels */ },
   socket(ctx) { /* Raw TCP connections */ },

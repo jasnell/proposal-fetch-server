@@ -63,7 +63,7 @@ for raw TCP) to be defined.
 
 ```js
 export default {
-  [Symbol.for('server.protocol')]: 1,
+  [Symbol.for('wintertc.server.protocol')]: 1,
 
   async fetch(ctx) {
     const { request } = ctx;
