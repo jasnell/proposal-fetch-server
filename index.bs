@@ -303,6 +303,7 @@ dictionary TimeoutOptions {
 dictionary LimitOptions {
   unsigned long long maxHeaderSize;
   unsigned long long maxRequestBodySize;
+  unsigned long long maxRequestsPerConnection;
   unsigned long maxConcurrentStreams;
   unsigned long maxConnections;
 };
@@ -310,6 +311,9 @@ dictionary LimitOptions {
 dictionary ServerOptions {
   unsigned short port;
   DOMString hostname;
+  boolean reusePort = false;
+  boolean ipv6Only = false;
+  unsigned long backlog;
   TLSOptions tls;
   (boolean or QUICOptions) quic = false;
   boolean autoContinue = true;
@@ -321,6 +325,9 @@ dictionary ServerOptions {
 dictionary ListenOptions {
   unsigned short port = 0;
   DOMString hostname = "0.0.0.0";
+  boolean reusePort = false;
+  boolean ipv6Only = false;
+  unsigned long backlog;
   TLSOptions tls;
   (boolean or QUICOptions) quic;
   TimeoutOptions timeouts;
@@ -1338,6 +1345,8 @@ The `fetch()` [=handler=] receives a {{ServerContext}} and returns a {{Response}
 
 Returning `undefined` is valid only after calling {{ServerContext/deny()}}, or when the [=exchange=] was [=exchange/aborted=]. Any other `undefined` &mdash; or any return value that is not a {{Response}} &mdash; is a programming error: the implementation invokes the `error()` handler ([[#handler-error]]) with a {{TypeError}} describing the invalid return, falling back to 500 Internal Server Error.
 
+Responses to HEAD requests are transmitted without content, per HTTP semantics: the implementation sends the head of the returned {{Response}} but not its body. Disposal of the unsent body stream, and preservation of content-related header fields derived from it, are left to the implementation.
+
 ```js
 async fetch(ctx) {
   const { request } = ctx;
@@ -1591,6 +1600,8 @@ When {{ServerOptions/port}} is `0`, the operating system assigns an available po
 
 The {{ServerOptions/autoContinue}} member controls automatic handling of `Expect: 100-continue` requests; see [[#servercontext-100-continue]]. The configured value is exposed to handlers via {{ServerContext/autoContinue}}.
 
+Three members, available on both {{ServerOptions}} and {{ListenOptions}}, configure the binding itself: {{ListenOptions/reusePort}} requests SO_REUSEPORT-style load distribution, allowing multiple processes or listeners to bind the same address and port; {{ListenOptions/ipv6Only}} restricts a wildcard IPv6 binding (e.g., `"::"`) to IPv6 rather than dual-stack; {{ListenOptions/backlog}} sets the accept queue depth, defaulting to an implementation-defined value. Where the platform cannot provide a requested binding capability, the binding operation throws a `"NotSupportedError"` {{DOMException}}, per [[#conformance]].
+
 TLS configuration {#serve-tls}
 ------------------------------
 
@@ -1735,6 +1746,12 @@ Resource limits are configured through the {{ServerOptions/limits}} member of {{
       <td>&mdash;</td>
     </tr>
     <tr>
+      <td>{{LimitOptions/maxRequestsPerConnection}}</td>
+      <td>Per connection, over its lifetime</td>
+      <td>Connection recycling, not an error: the final permitted response carries `Connection: close` (HTTP/1.1) or is followed by GOAWAY (HTTP/2, HTTP/3), and the connection closes gracefully</td>
+      <td>&mdash;</td>
+    </tr>
+    <tr>
       <td>{{LimitOptions/maxConcurrentStreams}}</td>
       <td>Per connection</td>
       <td>Protocol-level refusal of excess streams</td>
@@ -1828,6 +1845,8 @@ The <dfn method for="Closeable">close()</dfn> method initiates graceful shutdown
 
 On a {{Listener}}, it stops accepting new connections, sends GOAWAY frames on HTTP/2 and HTTP/3 connections, allows in-flight requests to complete, and resolves when all connections are closed.
 
+New [=exchanges=] arriving on existing connections during the drain &mdash; a request on an HTTP/1.1 keep-alive connection, or a stream racing the GOAWAY &mdash; are refused exactly as {{Closeable/busy}} refuses them, with the HTTP/1.1 fallback response additionally carrying `Connection: close`.
+
 On a {{Server}}, it calls {{Closeable/close()}} on every active listener and waits for all {{ServerContext/waitUntil()}} promises to settle.
 
 Closing a listener does not close the server. Other listeners remain active.
@@ -1895,6 +1914,8 @@ Transparent protocol handling {#http-versions-transparent}
 ----------------------------------------------------------
 
 A conforming implementation routes requests to the appropriate handler regardless of HTTP version. The `fetch()` handler receives all non-CONNECT requests. The `connect()` handler receives all CONNECT and extended CONNECT requests. The handler does not select which HTTP version to handle.
+
+Input that cannot be parsed into an [=exchange=] &mdash; invalid framing, an unparseable request line, a protocol violation &mdash; is handled entirely by the implementation (e.g., a 400 response, a connection close, or the protocol-appropriate error). No exchange is created, no handler is invoked, and no context or {{Request}} is materialized.
 
 Feature availability by protocol version {#http-versions-features}
 -------------------------------------------------------------------
