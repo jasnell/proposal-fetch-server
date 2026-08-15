@@ -76,7 +76,8 @@ This specification defines a server-side API that:
 <h3 class="no-num" id="related-specs">Relationship to Existing Specifications</h3>
 
 *   [Fetch Standard](https://fetch.spec.whatwg.org/): This specification depends on the {{Request}}, {{Response}}, {{Headers}}, and body definitions from Fetch. It assumes that {{Request}} and {{Response}} support trailers (`Promise<Headers>` `.trailers` property, `trailers` constructor option) and that `fetch()` supports an `onInformation` callback for receiving informational responses on the client side.
-*   [Streams Standard](https://streams.spec.whatwg.org/): {{ReadableStream}} and {{WritableStream}} are used for bodies, tunnel data, capsules, and datagrams.
+*   [Streams Standard](https://streams.spec.whatwg.org/): {{ReadableStream}} and {{WritableStream}} are used for bodies, tunnel data, capsules, and datagrams; {{ReadableWritablePair}} is the base of the {{CapsuleStream}} and {{DatagramStream}} dictionaries.
+*   [WebTransport](https://w3c.github.io/webtransport/) [[WEBTRANSPORT]]: {{WebTransportSession}} strictly follows the W3C WebTransport API. Its member types &mdash; {{WebTransportDatagramDuplexStream}}, {{WebTransportBidirectionalStream}}, {{WebTransportSendStream}}, {{WebTransportReceiveStream}}, {{WebTransportCloseInfo}}, {{WebTransportReliabilityMode}} &mdash; are defined by that specification and are not duplicated here.
 *   [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110): HTTP semantics, including trailer fields and informational responses.
 *   [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218): Extensible Prioritization Scheme for HTTP.
 *   [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297): HTTP Datagrams and the Capsule Protocol.
@@ -273,11 +274,6 @@ dictionary WebSocketUpgradeInit {
   sequence&lt;DOMString> protocol;
 };
 
-dictionary WebTransportCloseInfo {
-  unsigned long closeCode = 0;
-  USVString reason = "";
-};
-
 dictionary TLSCertificate {
   (DOMString or BufferSource) cert;
   (DOMString or BufferSource) key;
@@ -383,18 +379,16 @@ interface Tunnel {
 
 The {{Tunnel}} interface represents an established [=tunnel=] through an HTTP connection.
 
-The CapsuleStream interface {#idl-capsulestream}
+The CapsuleStream dictionary {#idl-capsulestream}
 -------------------------------------------------
 
 <pre class="idl">
-[Exposed=*]
-interface CapsuleStream {
-  readonly attribute ReadableStream readable;
-  readonly attribute WritableStream writable;
-};
+dictionary CapsuleStream : ReadableWritablePair {};
 </pre>
 
-The {{CapsuleStream}} interface provides typed access to the Capsule Protocol on the CONNECT data stream. The {{CapsuleStream/readable}} attribute yields {{Capsule}} objects. The {{CapsuleStream/writable}} attribute accepts {{Capsule}} objects.
+A {{CapsuleStream}} provides typed access to the Capsule Protocol on the CONNECT data stream. Its {{ReadableWritablePair/readable}} member yields {{Capsule}} objects; its {{ReadableWritablePair/writable}} member accepts {{Capsule}} objects.
+
+Note: {{CapsuleStream}} and {{DatagramStream}} are dictionaries, not interfaces: they are plain data carriers with no behavior of their own, returned once and destructured by the caller. Because they inherit from the Streams Standard's {{ReadableWritablePair}}, they may be passed anywhere a {{ReadableWritablePair}} is accepted, including {{ReadableStream/pipeThrough()}}.
 
 The Capsule dictionary {#idl-capsule}
 -------------------------------------
@@ -408,19 +402,18 @@ dictionary Capsule {
 
 A {{Capsule}} represents a single typed capsule as defined in [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297).
 
-The DatagramStream interface {#idl-datagramstream}
---------------------------------------------------
+The DatagramStream dictionary {#idl-datagramstream}
+---------------------------------------------------
 
 <pre class="idl">
-[Exposed=*]
-interface DatagramStream {
-  readonly attribute ReadableStream readable;
-  readonly attribute WritableStream writable;
-  readonly attribute boolean unreliable;
+dictionary DatagramStream : ReadableWritablePair {
+  required boolean unreliable;
 };
 </pre>
 
-The {{DatagramStream}} interface provides access to HTTP Datagrams associated with a [=tunnel=] or {{WebTransportSession}}. The {{DatagramStream/readable}} attribute yields {{Uint8Array}} payloads. The {{DatagramStream/writable}} attribute accepts {{Uint8Array}} payloads. The {{DatagramStream/unreliable}} attribute indicates whether datagrams are sent as unreliable QUIC DATAGRAM frames (`true`) or as reliable DATAGRAM capsules (`false`).
+A {{DatagramStream}} provides access to the HTTP Datagrams associated with a [=tunnel=]. Its {{ReadableWritablePair/readable}} member yields {{Uint8Array}} payloads; its {{ReadableWritablePair/writable}} member accepts {{Uint8Array}} payloads. The {{DatagramStream/unreliable}} member indicates whether datagrams are sent as unreliable QUIC DATAGRAM frames (`true`) or as reliable DATAGRAM capsules (`false`).
+
+Note: WebTransport session datagrams do not use {{DatagramStream}}; they use the {{WebTransportDatagramDuplexStream}} interface defined by [[WEBTRANSPORT]]. See [[#webtransport-datagrams]].
 
 The WebTransportSession interface {#idl-webtransportsession}
 ------------------------------------------------------------
@@ -428,33 +421,30 @@ The WebTransportSession interface {#idl-webtransportsession}
 <pre class="idl">
 [Exposed=*]
 interface WebTransportSession {
+  readonly attribute Promise&lt;undefined> ready;
+  readonly attribute WebTransportReliabilityMode reliability;
+
+  readonly attribute WebTransportDatagramDuplexStream datagrams;
+
+  Promise&lt;WebTransportBidirectionalStream> createBidirectionalStream(
+      optional WebTransportSendStreamOptions options = {});
+  /* a ReadableStream of WebTransportBidirectionalStream objects */
   readonly attribute ReadableStream incomingBidirectionalStreams;
+
+  Promise&lt;WebTransportSendStream> createUnidirectionalStream(
+      optional WebTransportSendStreamOptions options = {});
+  /* a ReadableStream of WebTransportReceiveStream objects */
   readonly attribute ReadableStream incomingUnidirectionalStreams;
-  Promise&lt;WebTransportBidirectionalStream> createBidirectionalStream();
-  Promise&lt;WritableStream> createUnidirectionalStream();
-
-  readonly attribute DatagramStream datagrams;
-
-  readonly attribute DOMString transport;
 
   undefined close(optional WebTransportCloseInfo closeInfo = {});
   readonly attribute Promise&lt;WebTransportCloseInfo> closed;
-  readonly attribute Promise&lt;undefined> ready;
+  readonly attribute Promise&lt;undefined> draining;
 };
 </pre>
 
-The {{WebTransportSession}} interface represents an established WebTransport session, providing multiplexed streams and datagrams over an HTTP connection.
+The {{WebTransportSession}} interface represents an established WebTransport session, providing multiplexed streams and datagrams over an HTTP connection. It is the server-side counterpart of the [[WEBTRANSPORT]] `WebTransport` interface, and strictly follows that specification's types: {{WebTransportDatagramDuplexStream}}, {{WebTransportBidirectionalStream}}, {{WebTransportSendStream}}, {{WebTransportReceiveStream}}, {{WebTransportSendStreamOptions}}, {{WebTransportCloseInfo}}, and {{WebTransportReliabilityMode}} are the interfaces, dictionaries, and enumerations defined by [[WEBTRANSPORT]]; this specification does not duplicate them. Each member of {{WebTransportSession}} has the semantics of the like-named member of the `WebTransport` interface, adapted to the server side of the session.
 
-The WebTransportBidirectionalStream interface {#idl-webtransportbidirectionalstream}
-------------------------------------------------------------------------------------
-
-<pre class="idl">
-[Exposed=*]
-interface WebTransportBidirectionalStream {
-  readonly attribute ReadableStream readable;
-  readonly attribute WritableStream writable;
-};
-</pre>
+Note: {{WebTransportSession}} deliberately omits the client-only surface of the `WebTransport` interface (the constructor, connection options, certificate hashes, `getStats()`, and pooling-related members). Additional members may be adopted as the server-side profile matures.
 
 The Closeable interface mixin {#idl-closeable}
 ----------------------------------------------
@@ -943,7 +933,7 @@ Capsule Protocol {#tunnel-capsules}
 -----------------------------------
 
 <div algorithm>
-The <dfn method for="Tunnel">capsules()</dfn> method returns a {{CapsuleStream}} providing typed access to the Capsule Protocol on the CONNECT data stream. Calling {{Tunnel/capsules()}} consumes the raw data stream &mdash; subsequent access to {{Tunnel/readable}} or {{Tunnel/writable}} throws an `"InvalidStateError"` {{DOMException}}.
+The <dfn method for="Tunnel">capsules()</dfn> method returns a {{CapsuleStream}} providing typed access to the Capsule Protocol on the CONNECT data stream. Calling {{Tunnel/capsules()}} consumes the raw data stream &mdash; subsequent access to {{Tunnel/readable}} or {{Tunnel/writable}}, and any subsequent call to {{Tunnel/capsules()}} itself, throws an `"InvalidStateError"` {{DOMException}}.
 </div>
 
 ```js
@@ -963,11 +953,11 @@ HTTP Datagrams {#tunnel-datagrams}
 ----------------------------------
 
 <div algorithm>
-The <dfn method for="Tunnel">datagrams()</dfn> method returns a {{DatagramStream}} providing access to HTTP Datagrams associated with this [=tunnel=].
+The <dfn method for="Tunnel">datagrams()</dfn> method returns a {{DatagramStream}} providing access to HTTP Datagrams associated with this [=tunnel=]. The method is idempotent in effect: each call returns a new dictionary object containing the same underlying {{ReadableStream}} and {{WritableStream}} objects.
 
-On HTTP/3 connections where QUIC DATAGRAM frames are available, datagrams are sent and received as unreliable QUIC DATAGRAM frames. The {{DatagramStream/unreliable}} property is `true`.
+On HTTP/3 connections where QUIC DATAGRAM frames are available, datagrams are sent and received as unreliable QUIC DATAGRAM frames. The {{DatagramStream/unreliable}} member is `true`.
 
-On HTTP/2 or HTTP/1.1 connections, datagrams are sent as DATAGRAM capsules (type `0x00`) on the data stream. The {{DatagramStream/unreliable}} property is `false`. Delivery is reliable (TCP guarantees it), but the API is the same.
+On HTTP/2 or HTTP/1.1 connections, datagrams are sent as DATAGRAM capsules (type `0x00`) on the data stream. The {{DatagramStream/unreliable}} member is `false`. Delivery is reliable (TCP guarantees it), but the API is the same.
 </div>
 
 Both [CONNECT-UDP](https://www.rfc-editor.org/rfc/rfc9298) and [CONNECT-IP](https://www.rfc-editor.org/rfc/rfc9484) use HTTP Datagrams for their data plane. The {{Tunnel/datagrams()}} API provides the foundation for both.
@@ -1010,10 +1000,10 @@ async connect(ctx) {
 Streams {#webtransport-streams}
 -------------------------------
 
-A {{WebTransportSession}} can carry multiple independent streams:
+A {{WebTransportSession}} can carry multiple independent streams, using the stream types defined by [[WEBTRANSPORT]]:
 
-*   Bidirectional streams: Opened by either side. Each has a {{WebTransportBidirectionalStream/readable}} and {{WebTransportBidirectionalStream/writable}}.
-*   Unidirectional streams: Opened by one side, read by the other.
+*   Bidirectional streams: Opened by either side. Each is a {{WebTransportBidirectionalStream}} whose `readable` is a {{WebTransportReceiveStream}} and whose `writable` is a {{WebTransportSendStream}}.
+*   Unidirectional streams: Opened by one side, read by the other, as a {{WebTransportSendStream}} or {{WebTransportReceiveStream}} respectively.
 
 On HTTP/3, each WebTransport stream maps to a native QUIC stream. Streams are independent: a slow stream does not block others.
 
@@ -1022,15 +1012,19 @@ On HTTP/2, streams are multiplexed over the single CONNECT data stream using the
 Datagrams {#webtransport-datagrams}
 -----------------------------------
 
-WebTransport datagrams follow the same {{DatagramStream}} interface as tunnel datagrams. The {{WebTransportSession/datagrams}} attribute provides a {{DatagramStream}}.
+The {{WebTransportSession/datagrams}} attribute is a {{WebTransportDatagramDuplexStream}} as defined by [[WEBTRANSPORT]]: incoming datagrams arrive on its `readable`, and outgoing datagram writables are created with `createWritable()`.
 
-Transport awareness {#webtransport-transport}
----------------------------------------------
+Note: This deliberately differs from a [=tunnel=]'s {{Tunnel/datagrams()}}, which returns the simpler {{DatagramStream}} pair. The WebTransport datagram surface carries session-level controls (maximum datagram size, expiration ages, buffer depths) and send-ordering machinery that [[WEBTRANSPORT]] defines and this specification does not duplicate.
 
-The {{WebTransportSession/transport}} property indicates the underlying transport mechanism:
+Reliability {#webtransport-reliability}
+---------------------------------------
 
-*   `"quic"`: Native QUIC streams and QUIC DATAGRAM frames. No head-of-line blocking between streams. Datagrams are unreliable.
-*   `"capsule"`: Capsule Protocol over a single HTTP/2 data stream. Head-of-line blocking applies. Datagrams are reliable (sent as DATAGRAM capsules).
+The {{WebTransportSession/reliability}} attribute (a {{WebTransportReliabilityMode}}, per [[WEBTRANSPORT]]) reflects the underlying transport mechanism:
+
+*   `"supports-unreliable"`: Native QUIC streams and QUIC DATAGRAM frames (HTTP/3). No head-of-line blocking between streams. Datagrams may be dropped.
+*   `"reliable-only"`: Capsule Protocol over a single HTTP/2 data stream. Head-of-line blocking applies. Datagrams are delivered reliably as DATAGRAM capsules.
+
+Because {{ConnectContext/upgradeWebTransport()}} resolves only once the session is established, the `"pending"` value is never observed on a {{WebTransportSession}}.
 
 
 Errors {#errors}

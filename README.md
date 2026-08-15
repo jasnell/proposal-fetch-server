@@ -154,7 +154,8 @@ npm test
 | Specification | Relationship |
 |--------------|-------------|
 | [Fetch Standard](https://fetch.spec.whatwg.org/) | `Request`, `Response`, `Headers`, `Body` definitions. Assumes trailer support and `onInformation` callback. |
-| [Streams Standard](https://streams.spec.whatwg.org/) | `ReadableStream` and `WritableStream` for bodies, tunnels, capsules, datagrams. |
+| [Streams Standard](https://streams.spec.whatwg.org/) | `ReadableStream` and `WritableStream` for bodies, tunnels, capsules, datagrams. `ReadableWritablePair` is the base of `CapsuleStream` and `DatagramStream`. |
+| [WebTransport](https://w3c.github.io/webtransport/) | `WebTransportSession` strictly follows the W3C WebTransport API's types (`WebTransportDatagramDuplexStream`, `WebTransportBidirectionalStream`, etc.); they are referenced, not duplicated. |
 | [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) | HTTP semantics (trailers, informational responses). |
 | [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218) | Extensible Prioritization Scheme. |
 | [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297) | HTTP Datagrams and the Capsule Protocol. |
