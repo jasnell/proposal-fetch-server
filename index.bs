@@ -86,6 +86,7 @@ This specification defines a server-side API that:
 *   [RFC 9298](https://www.rfc-editor.org/rfc/rfc9298): Proxying UDP in HTTP.
 *   [RFC 9484](https://www.rfc-editor.org/rfc/rfc9484): Proxying IP in HTTP.
 *   [RFC 9651](https://www.rfc-editor.org/rfc/rfc9651): Structured Field Values for HTTP.
+*   [RFC 7838](https://www.rfc-editor.org/rfc/rfc7838): HTTP Alternative Services, for advertisement of HTTP/3 bindings.
 
 <h3 class="no-num" id="design-rationale">Design Rationale</h3>
 
@@ -316,6 +317,7 @@ dictionary ServerOptions {
   unsigned long backlog;
   TLSOptions tls;
   (boolean or QUICOptions) quic = false;
+  (boolean or DOMString) altSvc;
   boolean autoContinue = true;
   TimeoutOptions timeouts;
   LimitOptions limits;
@@ -330,6 +332,7 @@ dictionary ListenOptions {
   unsigned long backlog;
   TLSOptions tls;
   (boolean or QUICOptions) quic;
+  (boolean or DOMString) altSvc;
   TimeoutOptions timeouts;
   LimitOptions limits;
 };
@@ -1653,6 +1656,19 @@ QUIC configuration {#serve-quic}
 When {{ServerOptions/quic}} is `true` or a {{QUICOptions}} object, the server additionally listens for QUIC connections on the same port and supports HTTP/3.
 
 HTTP/3 requires TLS. If {{ServerOptions/quic}} is enabled and {{ServerOptions/tls}} is not provided, the implementation throws a {{TypeError}}. If {{ServerOptions/quic}} is enabled and the implementation does not support QUIC, it throws a `"NotSupportedError"` {{DOMException}} (see [[#conformance]]).
+
+Alternative services {#serve-altsvc}
+------------------------------------
+
+The {{ServerOptions/altSvc}} member &mdash; available on both {{ServerOptions}} and {{ListenOptions}}, overriding per binding &mdash; controls advertisement of alternative services per [RFC 7838](https://www.rfc-editor.org/rfc/rfc7838):
+
+*   When `true`, or absent while {{ServerOptions/quic}} is enabled, advertisement is automatic: on responses sent over TCP-based connections, the implementation advertises its own QUIC binding(s) for the same effective origin (e.g., `h3=":443"`), composing the field value and its `ma` parameter itself. The implementation MAY use the `Alt-Svc` response header field or, on HTTP/2, the ALTSVC frame.
+*   When a string, the value is used verbatim as the `Alt-Svc` field value. This covers advertising a different host or port, custom `ma` or `persist` parameters, and `clear`.
+*   When `false`, no advertisement is performed.
+
+If a {{Response}} returned by the handler already carries an `Alt-Svc` header field, the implementation does not override or supplement it. No advertisement is sent on connections that are not TLS-protected; clients ignore alternative services from insecure origins.
+
+Note: Advertisement is how clients discover an HTTP/3 binding ([[#serve-quic]]). Without it, a QUIC-enabled listener is reachable only by clients that already know of it through other means, such as DNS HTTPS records &mdash; which are outside the scope of this specification. Only the implementation can perform the frame-based form of advertisement, and only the implementation reliably knows its own bindings; this is why advertisement is implementation behavior rather than an application concern.
 
 Timeouts {#serve-timeouts}
 --------------------------

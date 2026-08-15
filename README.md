@@ -162,6 +162,7 @@ npm test
 | [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441) / [RFC 9220](https://www.rfc-editor.org/rfc/rfc9220) | WebSocket via extended CONNECT (HTTP/2, HTTP/3). |
 | [RFC 9298](https://www.rfc-editor.org/rfc/rfc9298) | Proxying UDP in HTTP. |
 | [RFC 9484](https://www.rfc-editor.org/rfc/rfc9484) | Proxying IP in HTTP. |
+| [RFC 7838](https://www.rfc-editor.org/rfc/rfc7838) | HTTP Alternative Services (advertisement of HTTP/3 bindings). |
 
 ## License
 
