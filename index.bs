@@ -801,7 +801,7 @@ This is analogous to `ExtendableEvent.waitUntil()` in [Service Workers](https://
 
 Unlike the optional features enumerated in [[#conformance]], {{ServerContext/waitUntil()}} MUST be supported by every implementation: applications depend on it for cleanup and logging actions that must complete.
 
-An implementation MAY impose an implementation-defined time limit on how long it will wait for outstanding {{ServerContext/waitUntil()}} promises to settle. In the infrastructure layer, this limit is configurable via the {{TimeoutOptions/waitUntil}} member of {{TimeoutOptions}} ([[#serve-timeouts]]).
+An implementation MAY impose an implementation-defined time limit on how long it will wait for outstanding {{ServerContext/waitUntil()}} promises to settle. In the infrastructure layer, this limit is configurable via the {{TimeoutOptions/waitUntil}} member of {{TimeoutOptions}} ([[#serve-timeouts]]). Reaching the limit does not cancel the promises &mdash; the exchange simply stops waiting for them; see [[#serve-timeouts]].
 
 If a promise passed to {{ServerContext/waitUntil()}} rejects, the implementation reports the rejection in an implementation-defined manner (e.g., logging). The rejection does not affect the response and does not invoke the handler's `error()` method ([[#handler-error]]).
 
@@ -1649,7 +1649,7 @@ Activity timeouts are configured through the {{ServerOptions/timeouts}} member o
       <td>{{TimeoutOptions/waitUntil}}</td>
       <td>exchange</td>
       <td>{{ServerContext/waitUntil()}} promises remain unsettled after the response has completed</td>
-      <td>Stop waiting; report outstanding rejections; the exchange completes</td>
+      <td>The exchange stops waiting and completes; the promises are not cancelled (see below)</td>
     </tr>
   </tbody>
 </table>
@@ -1661,6 +1661,8 @@ Two principles govern every member:
 *   **Expiry is existing machinery.** Exchange-level expiry produces the [=exchange/aborted=] state with a typed [=protocol error=], flowing through the same surfaces as any inbound termination; tunnel expiry is {{Tunnel/destroy()}}; connection expiry is the GOAWAY path. The `error()` handler is never invoked for a timeout &mdash; timeouts are not handler faults.
 
 On the wire, a stream reset caused by {{TimeoutOptions/receive}} or {{TimeoutOptions/send}} expiry carries CANCEL (HTTP/2) or H3_REQUEST_CANCELLED (HTTP/3), while the JavaScript-observable [=protocol error=] carries `ERR_HTTP_TIMEOUT`: the wire says the request is no longer wanted; the API says why.
+
+Expiry of {{TimeoutOptions/waitUntil}} does not &mdash; and cannot &mdash; cancel the outstanding promises: JavaScript has no promise cancellation, and the work behind them is not aborted. Expiry means only that the [=exchange=] stops waiting for them: the exchange is considered complete, and resources the implementation associates with it may be torn down without further delay. The promises may still settle afterward; a late settlement has no effect on the exchange, and a late rejection is reported the same way as any {{ServerContext/waitUntil()}} rejection ([[#servercontext-lifecycle]]). Whether the work itself continues to run after teardown depends on the runtime's execution model.
 
 Implementations SHOULD enable {{TimeoutOptions/handshake}}, {{TimeoutOptions/idle}}, and {{TimeoutOptions/headers}} by default with implementation-defined values &mdash; they are connection hygiene. {{TimeoutOptions/tunnelIdle}} SHOULD be disabled by default: a quiet WebSocket or WebTransport session is legitimate, and keepalive traffic (ping/pong frames, session keepalives) counts as activity, so deployments that enable it compose with standard liveness practice.
 
