@@ -164,13 +164,14 @@ A conforming implementation shall also conform to [[!ECMASCRIPT]] and [[!WEBIDL]
 Support for the following features is OPTIONAL at both layers:
 
 *   Priority
+*   Completion signaling
 *   Informational responses
 *   Extended CONNECT and tunnel protocols
 *   WebTransport
 *   HTTP Datagrams
 *   HTTP/3 and QUIC
 
-An implementation that does not support an optional feature MUST still expose the relevant interface members. A method whose effect the implementation cannot provide throws a `"NotSupportedError"` {{DOMException}}; promise-returning methods reject with the same error. Priority is the exception: it is advisory by design and degrades silently &mdash; {{ServerContext/clientPriority}} returns the defaults, assignments to {{ServerContext/serverPriority}} are accepted and ignored, and an {{ServerContext/onpriority}} callback is never invoked.
+An implementation that does not support an optional feature MUST still expose the relevant interface members. A method whose effect the implementation cannot provide throws a `"NotSupportedError"` {{DOMException}}; promise-returning methods reject with the same error. Priority and completion signaling are the exceptions: they are advisory by design and degrade silently. For priority, {{ServerContext/clientPriority}} returns the defaults, assignments to {{ServerContext/serverPriority}} are accepted and ignored, and an {{ServerContext/onpriority}} callback is never invoked. For completion signaling, {{ServerContext/completed}} returns `null` ([[#servercontext-lifecycle]]).
 
 {{ServerContext/deny()}} and {{ServerContext/waitUntil()}} are not optional. Every implementation can decline a request; the wire-level fidelity of [=error codes=] varies by protocol, and where a signal is unavailable the implementation uses the closest supported behavior (e.g., the HTTP/1.1 fallback in [[#servercontext-denial]]). Applications rely on {{ServerContext/waitUntil()}} for cleanup and logging actions that must complete, so every implementation MUST honor it (subject to the time limit in [[#servercontext-lifecycle]]).
 
@@ -299,6 +300,13 @@ dictionary TimeoutOptions {
   unsigned long long waitUntil;
 };
 
+dictionary LimitOptions {
+  unsigned long long maxHeaderSize;
+  unsigned long long maxRequestBodySize;
+  unsigned long maxConcurrentStreams;
+  unsigned long maxConnections;
+};
+
 dictionary ServerOptions {
   unsigned short port;
   DOMString hostname;
@@ -306,6 +314,7 @@ dictionary ServerOptions {
   (boolean or QUICOptions) quic = false;
   boolean autoContinue = true;
   TimeoutOptions timeouts;
+  LimitOptions limits;
   AbortSignal signal;
 };
 
@@ -315,6 +324,7 @@ dictionary ListenOptions {
   TLSOptions tls;
   (boolean or QUICOptions) quic;
   TimeoutOptions timeouts;
+  LimitOptions limits;
 };
 
 dictionary HandlerObject {
@@ -348,6 +358,7 @@ interface ServerContext {
 
   undefined deny(optional any error);
 
+  readonly attribute Promise&lt;undefined>? completed;
   undefined waitUntil(Promise&lt;any> promise);
 };
 </pre>
@@ -805,6 +816,33 @@ An implementation MAY impose an implementation-defined time limit on how long it
 
 If a promise passed to {{ServerContext/waitUntil()}} rejects, the implementation reports the rejection in an implementation-defined manner (e.g., logging). The rejection does not affect the response and does not invoke the handler's `error()` method ([[#handler-error]]).
 
+<div algorithm>
+The <dfn attribute for="ServerContext">completed</dfn> attribute returns a promise that settles when the [=exchange=] reaches a terminal state, or `null` if the implementation is not tracking completion for this exchange.
+
+<ul>
+<li>The promise is fulfilled when the exchange concluded as the server directed: the response was fully handed to the transport (including any trailers), or the denial signal was sent following {{ServerContext/deny()}}.
+<li>The promise is rejected with the [=protocol error=] when the exchange terminated out from under the server: client abort, stream reset, connection loss, or a timeout ([[#serve-timeouts]]).
+</ul>
+</div>
+
+"Handed to the transport" does not imply delivery acknowledgment from the peer. {{ServerContext/completed}} reports response delivery only; it does not wait for {{ServerContext/waitUntil()}} promises to settle.
+
+The value is stable for the lifetime of the exchange: repeated gets return the same promise, or `null` consistently.
+
+An implementation MAY return `null` globally, per deployment, or per exchange &mdash; for example, for a response handed off to a transport-level optimization the implementation no longer observes. A non-null {{ServerContext/completed}} does not obligate the implementation to extend the lifetime of the execution environment beyond its normal policy; where tracking completion would require doing so, returning `null` is the conforming behavior.
+
+Note: `await ctx.completed` degrades gracefully where completion is untracked, since awaiting `null` yields `null` immediately. Code written against this attribute cannot hang on runtimes that do not provide it:
+
+```js
+const start = performance.now();
+const response = await inner(ctx);
+ctx.completed?.then(
+  () => log('sent', performance.now() - start),
+  (err) => log('aborted', err.code),
+);
+return response;
+```
+
 
 ConnectContext {#sec-connectcontext}
 ====================================
@@ -1223,6 +1261,11 @@ An <dfn export>error code</dfn> is a string identifying a protocol-level error c
       <td colspan=2>transport-level</td>
       <td>An implementation-defined or configured ([[#serve-timeouts]]) timeout elapsed.</td>
     </tr>
+    <tr>
+      <td><dfn export>`ERR_HTTP_CONTENT_TOO_LARGE`</dfn></td>
+      <td colspan=2>413 (Content Too Large) before commitment; stream reset after</td>
+      <td>A configured request content limit was exceeded ([[#serve-limits]]).</td>
+    </tr>
   </tbody>
 </table>
 
@@ -1232,6 +1275,7 @@ Where each code may appear:
 *   Sendable by aborting a committed response ([[#errors-outbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR` (the default).
 *   Sendable by cancelling the request body ([[#errors-outbound]]): `ERR_HTTP_REQUEST_BODY_REJECTED`.
 *   Sendable by aborting a [=tunnel=]'s constituent streams ([[#errors-outbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR`, `ERR_HTTP_CONNECT_ERROR` (the default).
+*   Surfaced on request body reads when a configured content limit is exceeded ([[#serve-limits]]): `ERR_HTTP_CONTENT_TOO_LARGE`.
 *   Observable inbound ([[#errors-inbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_STREAM_RESET`, `ERR_HTTP_PROTOCOL_ERROR`, `ERR_HTTP_GOAWAY`, `ERR_HTTP_CONNECT_ERROR`, `ERR_HTTP_CONNECTION_RESET`, `ERR_HTTP_TIMEOUT`.
 
 Note: The registry is deliberately small. Most HTTP/2 and HTTP/3 error codes (`FLOW_CONTROL_ERROR`, `FRAME_SIZE_ERROR`, ...) are protocol plumbing that applications cannot act on; unrecognized wire codes surface as `ERR_HTTP_STREAM_RESET`. The taxonomy is designed to be shared with client-side `fetch()` error reporting, where the same codes describe the same wire events observed from the other end.
@@ -1667,6 +1711,49 @@ Expiry of {{TimeoutOptions/waitUntil}} does not &mdash; and cannot &mdash; cance
 Implementations SHOULD enable {{TimeoutOptions/handshake}}, {{TimeoutOptions/idle}}, and {{TimeoutOptions/headers}} by default with implementation-defined values &mdash; they are connection hygiene. {{TimeoutOptions/tunnelIdle}} SHOULD be disabled by default: a quiet WebSocket or WebTransport session is legitimate, and keepalive traffic (ping/pong frames, session keepalives) counts as activity, so deployments that enable it compose with standard liveness practice.
 
 Note: Runtimes that do not implement the infrastructure layer determine timeout behavior externally, as with the other members of {{ServerOptions}} (see [[#conformance]]).
+
+Limits {#serve-limits}
+----------------------
+
+Resource limits are configured through the {{ServerOptions/limits}} member of {{ServerOptions}}. A {{ListenOptions/limits}} member on {{ListenOptions}} overrides the server-level configuration member-wise for that binding. An explicit `0` disables a limit; an absent member leaves the value implementation-defined. Like timeouts, limits are enforced below the handler: they are denial-of-service hygiene that applications cannot enforce efficiently themselves, because by the time application code can count bytes, the resources are already committed.
+
+<table>
+  <thead>
+    <tr><th>Member</th><th>Enforced</th><th>On violation</th><th>Wire alignment</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>{{LimitOptions/maxHeaderSize}}</td>
+      <td>During head parsing, before dispatch</td>
+      <td>431 (Request Header Fields Too Large) on HTTP/1.1; stream or connection error on HTTP/2 and HTTP/3. The handler is never invoked</td>
+      <td>Advertised as SETTINGS_MAX_HEADER_LIST_SIZE (HTTP/2) and SETTINGS_MAX_FIELD_SECTION_SIZE (HTTP/3)</td>
+    </tr>
+    <tr>
+      <td>{{LimitOptions/maxRequestBodySize}}</td>
+      <td>Against the declared length before dispatch, and against streamed bytes during the exchange</td>
+      <td>Declared (`Content-Length` exceeds the limit): 413 (Content Too Large) before dispatch; the handler is never invoked. Streamed overrun: see below</td>
+      <td>&mdash;</td>
+    </tr>
+    <tr>
+      <td>{{LimitOptions/maxConcurrentStreams}}</td>
+      <td>Per connection</td>
+      <td>Protocol-level refusal of excess streams</td>
+      <td>SETTINGS_MAX_CONCURRENT_STREAMS (HTTP/2); stream credit (HTTP/3)</td>
+    </tr>
+    <tr>
+      <td>{{LimitOptions/maxConnections}}</td>
+      <td>Per listener</td>
+      <td>Implementation-defined refusal of new connections</td>
+      <td>&mdash;</td>
+    </tr>
+  </tbody>
+</table>
+
+Pre-dispatch rejections follow the {{Closeable/busy}} precedent: no handler is invoked, and no context or {{Request}} need be materialized for the rejected exchange.
+
+When a request body exceeds {{LimitOptions/maxRequestBodySize}} mid-stream &mdash; the length was undeclared, or the declaration was dishonest &mdash; reads from the request body reject with a [=protocol error=] whose code is `ERR_HTTP_CONTENT_TOO_LARGE`, and the implementation stops accepting the remainder of the upload as with request body refusal ([[#errors-outbound]]). The handler remains in control of the response. If the handler subsequently faults with that protocol error while the exchange is still [=response-capable=] and the `error()` handler does not produce a response, the implementation SHOULD use 413 (Content Too Large) as the fallback status rather than 500.
+
+Note: Runtimes that do not implement the infrastructure layer determine limit behavior externally, as with the other members of {{ServerOptions}} (see [[#conformance]]).
 
 
 Server and Listener {#server-listener}
