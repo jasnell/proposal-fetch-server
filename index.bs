@@ -380,6 +380,8 @@ interface Tunnel {
 
 The {{Tunnel}} interface represents an established [=tunnel=] through an HTTP connection. It supports `Symbol.asyncDispose`, enabling `await using` declarations; see [[#tunnel-closure]].
 
+Note: {{Tunnel}} structurally satisfies {{ReadableWritablePair}} &mdash; like {{TransformStream}}, it declares `readable` and `writable` attributes rather than inheriting the dictionary (Web IDL does not permit an interface to inherit from a dictionary, and the attributes carry behavior a dictionary snapshot cannot: after {{Tunnel/capsules()}}, they throw). It may therefore be passed directly to {{ReadableStream/pipeThrough()}} and anywhere else a {{ReadableWritablePair}} is accepted; once {{Tunnel/capsules()}} has been called, such conversion throws an `"InvalidStateError"` {{DOMException}}, correctly.
+
 The CapsuleStream dictionary {#idl-capsulestream}
 -------------------------------------------------
 
