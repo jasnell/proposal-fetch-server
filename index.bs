@@ -80,7 +80,7 @@ This specification defines a server-side API that:
 
 3.  **Response helpers**: This specification does not define convenience methods for building responses (no `ctx.json()`, `ctx.html()`, etc.). Handlers return a standard {{Response}}.
 
-4.  **Replacing existing APIs**: This does not replace `node:http`, `node:http2`, `Deno.serve()`, `Bun.serve()`, or any existing API. Existing APIs continue to work.
+4.  **Replacing existing APIs**: This specification does not replace or deprecate existing runtime-specific server APIs. Those APIs continue to work alongside it.
 
 5.  **Browser implementation**: This specification targets server-side runtimes.
 
@@ -119,11 +119,7 @@ The properties needed on the server side fall into distinct categories:
 
 None of these are properties of the HTTP message itself. Putting them on {{Request}} conflates the message with its processing environment. A context object keeps them separate.
 
-Runtimes have independently arrived at similar patterns:
-
-*   Cloudflare Workers: `fetch(request, env, ctx)` — three positional arguments, where `ctx` provides `waitUntil()`.
-*   Deno: `Deno.serve((request, info) => ...)` — two arguments, where `info` provides `remoteAddr` and `completed`.
-*   Hono: `(c) => ...` — a context object with `c.req` for the request.
+Existing server-side runtimes and frameworks have independently arrived at similar patterns: some pass the {{Request}} along with additional positional arguments carrying lifecycle operations (such as `waitUntil()`) or connection metadata (such as the remote address); others pass a single context object that wraps the request.
 
 A single context object avoids positional fragility and extends without signature changes.
 
@@ -168,7 +164,7 @@ This specification has two layers:
 **Infrastructure** (server lifecycle): The `serve()` function, {{Server}}, {{Listener}}, {{Closeable}}, {{ListenOptions}}, {{ServerOptions}}, and {{TLSOptions}}. An implementation MAY support this layer. An implementation that manages server lifecycle externally (e.g., an edge runtime where binding, TLS, and connection management are handled by the platform outside the application) is not required to expose `serve()`, {{Server}}, or {{Listener}}. Such an implementation is conforming as long as it implements the core layer.
 
 <div class="note">
-Cloudflare Workers is an example of a runtime that would implement the core layer but not the infrastructure layer. The application exports a handler object; the platform handles everything else. Node.js and Deno are examples of runtimes that would implement both layers.
+The two layers correspond to two deployment models. Where the platform owns the server &mdash; the application supplies only a handler object, and the platform handles everything else &mdash; an implementation would provide the core layer alone. Where applications create and manage their own servers, an implementation would typically provide both layers.
 </div>
 
 A conforming implementation shall also conform to [[!ECMASCRIPT]] and [[!WEBIDL]].
@@ -541,15 +537,12 @@ The serve() function {#idl-serve}
 ---------------------------------
 
 <pre class="idl">
-[Exposed=*]
-namespace FetchServer {
-  Server serve(HandlerObject handler, optional ServerOptions options = {});
+partial interface mixin WindowOrWorkerGlobalScope {
+  [NewObject] Server serve(HandlerObject handler, optional ServerOptions options = {});
 };
 </pre>
 
-<div class="note">
-The namespace `FetchServer` is used here for specification purposes. The actual module specifier is implementation-defined. Possible values include `"http"`, `"node:http"`, `"node:serve"`, or a WinterTC-standardized module name. The import surface is an open question; see [[#open-module-specifier]].
-</div>
+The {{WindowOrWorkerGlobalScope/serve()}} function is exposed on the global object, as `fetch()` is. It is part of the infrastructure layer ([[#conformance]]).
 
 
 Exchange states {#exchange-states}
@@ -829,7 +822,7 @@ Request lifecycle {#servercontext-lifecycle}
 The <dfn method for="ServerContext">waitUntil(promise)</dfn> method extends the lifetime of the request processing beyond the return of the handler function. The [=server=] does not consider the request fully complete until all promises passed to {{ServerContext/waitUntil()}} have settled.
 </div>
 
-This is analogous to `ExtendableEvent.waitUntil()` in [Service Workers](https://w3c.github.io/ServiceWorker/) and `ctx.waitUntil()` in Cloudflare Workers.
+This is analogous to `ExtendableEvent.waitUntil()` in [Service Workers](https://w3c.github.io/ServiceWorker/), and to similar lifecycle-extension mechanisms in existing server-side runtimes.
 
 Unlike the optional features enumerated in [[#conformance]], {{ServerContext/waitUntil()}} MUST be supported by every implementation: applications depend on it for cleanup and logging actions that must complete.
 
@@ -1502,7 +1495,7 @@ When the handler is an object with methods, `this` inside the handler refers to 
 ```js
 const app = {
   [Symbol.for('wintertc.server.protocol')]: 1,
-  db: createPool(process.env.DATABASE_URL),
+  db: createPool(databaseUrl),
 
   async fetch(ctx) {
     const rows = await this.db.query('SELECT * FROM users');
@@ -1520,7 +1513,7 @@ serve(app, { port: 443, tls: { cert, key } });
 Declarative export and protocol identification {#handler-declarative}
 ---------------------------------------------------------------------
 
-As an alternative to the imperative `serve()` call, an application may export a default handler object. Because existing runtimes already use `export default { fetch() {} }` with different handler signatures (e.g., Cloudflare Workers passes `(Request, Env, ExecutionContext)`, Deno passes `(Request, ServeHandlerInfo)`), a handler object includes a [=protocol marker=] so the runtime can distinguish this API from legacy invocation conventions.
+As an alternative to the imperative `serve()` call, an application may export a default handler object. Because existing runtimes already use `export default { fetch() {} }` with their own, mutually incompatible handler signatures (typically a {{Request}} followed by runtime-specific arguments), a handler object includes a [=protocol marker=] so the runtime can distinguish this API from legacy invocation conventions.
 
 The marker is a `Symbol.for('wintertc.server.protocol')` property with an integer version value:
 
@@ -1559,10 +1552,10 @@ const handler = {
   fetch(ctx) { return new Response("Hello"); },
 };
 
-// In Workers or similar edge runtime:
+// Declarative, where the platform manages the server:
 export default handler;
 
-// In Node.js, Deno, or Bun:
+// Imperative, where the application manages the server:
 serve(handler, { port: 443, tls: { cert, key } });
 ```
 
@@ -1574,7 +1567,7 @@ The serve() function {#serve-function}
 --------------------------------------
 
 <div algorithm>
-The <dfn method for="FetchServer">serve(handler, options)</dfn> function creates a {{Server}}. If {{ServerOptions/hostname}} and {{ServerOptions/port}} (or {{ServerOptions/signal}}) are provided in the |options|, the server begins listening immediately. Otherwise, the server is created in an unbound state and must be explicitly started with {{Server/listen()}}.
+The <dfn method for="WindowOrWorkerGlobalScope">serve(handler, options)</dfn> function creates a {{Server}}. If {{ServerOptions/hostname}} and {{ServerOptions/port}} (or {{ServerOptions/signal}}) are provided in the |options|, the server begins listening immediately. Otherwise, the server is created in an unbound state and must be explicitly started with {{Server/listen()}}.
 </div>
 
 ```js
@@ -1587,10 +1580,7 @@ const server = serve({
 }, {
   port: 443,
   hostname: '0.0.0.0',
-  tls: {
-    cert: readFileSync('cert.pem'),
-    key: readFileSync('key.pem'),
-  },
+  tls: { cert, key },
   quic: true,
 });
 
@@ -1981,17 +1971,6 @@ Security considerations {#security}
 
 Open issues {#open-issues}
 ==========================
-
-Module specifier {#open-module-specifier}
------------------------------------------
-
-The import path for `serve()` is left implementation-defined. Possible values include:
-
-*   `node:http` (extending the existing Node.js module)
-*   `node:serve` (new Node.js module)
-*   `http` (generic, non-Node.js-specific)
-
-A standardized module specifier may be desirable if this API is adopted by WinterTC.
 
 Structured fields on Headers {#open-structured-fields}
 ------------------------------------------------------
