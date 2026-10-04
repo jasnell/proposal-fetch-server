@@ -22,6 +22,7 @@ spec:dom; type:interface; text:AbortSignal
 spec:dom; type:interface; text:AbortController
 
 spec:streams; type:interface; text:ReadableStream
+spec:streams; type:interface; text:WritableStream
 
 spec:websockets; type:interface; text:WebSocket
 
@@ -46,6 +47,13 @@ spec:dom; type:dfn; text:signal abort
     "title": "Iterable Streams API",
     "publisher": "Ecma TC55 (WinterTC)",
     "status": "Draft Proposal"
+  },
+  "WEBSOCKETSTREAM": {
+    "authors": ["Adam Rice"],
+    "href": "https://github.com/whatwg/websockets/pull/48",
+    "title": "The WebSocketStream Interface (WebSockets Standard pull request #48)",
+    "publisher": "WHATWG",
+    "status": "Pull Request"
   }
 }
 </pre>
@@ -103,13 +111,15 @@ This specification defines a server-side API inspired by fetch that:
 <h3 class="no-num" id="related-specs">Relationship to Existing Specifications</h3>
 
 *   [Fetch Standard](https://fetch.spec.whatwg.org/): {{ServerRequest}}, {{ServerResponse}}, and {{ServerHeaders}} are modeled on the Fetch Standard's {{Request}}, {{Response}}, and {{Headers}}, and this specification uses the Fetch Standard's concepts and algorithms &mdash; such as header lists, status codes, and the encodings of non-streaming bodies &mdash; where the behavior is the same. It does not depend on the {{Request}}, {{Response}}, or {{Headers}} interfaces themselves. It assumes that `fetch()` supports an `onInformation` callback for receiving informational responses on the client side.
-*   [Streams Standard](https://streams.spec.whatwg.org/): a {{ReadableStream}} is accepted as the body of a {{ServerResponse}}, and the [[WEBTRANSPORT]] stream types used by {{WebTransportSession}} are built on this standard.
+*   [Streams Standard](https://streams.spec.whatwg.org/): a {{ReadableStream}} is accepted as the body of a {{ServerResponse}}, the messages of a {{ServerWebSocketStream}} are read from a {{ReadableStream}} and written to a {{WritableStream}}, and the [[WEBTRANSPORT]] stream types used by {{WebTransportSession}} are built on this standard.
 *   [Iterable Streams API](https://iter-streams.proposal.wintertc.org/) [[ITER-STREAMS]]: the bodies of a {{ServerRequest}} and a {{ServerResponse}} are async iterables of batched {{Uint8Array}} chunks, following that specification's stream model. A {{Tunnel}} has the shape of its {{DuplexChannel}}: tunnel data and datagrams are read as {{ByteReadableStream}}s and written through {{Writer}}s.
+*   [WebSockets Standard](https://websockets.spec.whatwg.org/) [[WEBSOCKETS]]: {{ConnectContext/upgradeWebSocket()}} returns the {{WebSocket}} interface it defines. {{ServerWebSocketStream}} is modeled on the `WebSocketStream` interface proposed for that standard [[WEBSOCKETSTREAM]], which is not yet part of it ([[#idl-serverwebsocketstream]]).
 *   [WebTransport](https://w3c.github.io/webtransport/) [[WEBTRANSPORT]]: {{WebTransportSession}} strictly follows the W3C WebTransport API. Its member types &mdash; {{WebTransportDatagramDuplexStream}}, {{WebTransportBidirectionalStream}}, {{WebTransportSendStream}}, {{WebTransportReceiveStream}}, {{WebTransportCloseInfo}}, {{WebTransportReliabilityMode}} &mdash; are defined by that specification and are not duplicated here.
 *   [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110): HTTP semantics, including trailer fields and informational responses.
 *   [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218): Extensible Prioritization Scheme for HTTP.
 *   [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297): HTTP Datagrams and the Capsule Protocol.
 *   [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221): Unreliable Datagram Extension to QUIC.
+*   [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455): The WebSocket Protocol, including its closing handshake and close codes.
 *   [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441) / [RFC 9220](https://www.rfc-editor.org/rfc/rfc9220): WebSocket bootstrapping via extended CONNECT over HTTP/2 and HTTP/3.
 *   [RFC 9298](https://www.rfc-editor.org/rfc/rfc9298): Proxying UDP in HTTP.
 *   [RFC 9484](https://www.rfc-editor.org/rfc/rfc9484): Proxying IP in HTTP.
@@ -162,6 +172,7 @@ This proposal defines the [=Fetch Server API=], a server-side HTTP API modeled o
 *   A {{ConnectContext}} interface extending {{ServerContext}} for CONNECT and extended CONNECT tunnel protocols.
 *   An [=exchange=] state model governing response commitment, and an [=error code=] registry mapping protocol-version-independent codes to HTTP/2 and HTTP/3 error signals.
 *   A {{Tunnel}} interface for bidirectional communication over established HTTP tunnels, read and written as iterable streams [[ITER-STREAMS]], including the Capsule Protocol and HTTP Datagrams.
+*   A {{ServerWebSocketStream}} interface for WebSocket connections whose messages are read and written as streams, with backpressure.
 *   A {{WebTransportSession}} interface for multiplexed streams and datagrams over HTTP connections.
 *   A handler object model with `fetch()` and `connect()` methods for processing requests and tunnels.
 *   An optional infrastructure layer providing `serve()`, {{Server}}, {{Listener}}, and lifecycle management.
@@ -497,6 +508,7 @@ interface ConnectContext : ServerContext {
   Promise&lt;Tunnel> accept(optional ConnectAcceptInit init = {});
 
   WebSocket upgradeWebSocket(optional WebSocketUpgradeInit options = {});
+  ServerWebSocketStream upgradeWebSocketStream(optional WebSocketUpgradeInit options = {});
   Promise&lt;WebTransportSession> upgradeWebTransport();
 };
 </pre>
@@ -569,6 +581,41 @@ A {{DatagramStream}} provides access to the HTTP Datagrams associated with a [=t
 Note: {{DatagramStream}} is a dictionary, not an interface: a plain data carrier with no behavior of its own, returned by {{Tunnel/datagrams()}} and destructured by the caller.
 
 Note: WebTransport session datagrams do not use {{DatagramStream}}; they use the {{WebTransportDatagramDuplexStream}} interface defined by [[WEBTRANSPORT]]. See [[#webtransport-datagrams]].
+
+The ServerWebSocketStream interface {#idl-serverwebsocketstream}
+----------------------------------------------------------------
+
+<pre class="idl">
+dictionary WebSocketOpenInfo {
+  ReadableStream readable;
+  WritableStream writable;
+  DOMString extensions;
+  DOMString protocol;
+};
+
+dictionary WebSocketCloseInfo {
+  [EnforceRange] unsigned short closeCode;
+  USVString reason = "";
+};
+
+[Exposed=*]
+interface ServerWebSocketStream {
+  readonly attribute Promise&lt;WebSocketOpenInfo> opened;
+  readonly attribute Promise&lt;WebSocketCloseInfo> closed;
+  undefined close(optional WebSocketCloseInfo closeInfo = {});
+
+  /* server-side extension; not part of WebSocketStream */
+  undefined destroy(optional any error);
+};
+</pre>
+
+The {{ServerWebSocketStream}} interface represents an established WebSocket connection whose messages are read and written as streams [[!STREAMS]]: each chunk of its {{WebSocketOpenInfo/readable}} stream is one message received from the peer, and each chunk written to its {{WebSocketOpenInfo/writable}} stream is sent as one message. Unlike the {{WebSocket}} returned by {{ConnectContext/upgradeWebSocket()}}, it applies backpressure in both directions ([[#websocketstream-messages]]). It supports `Symbol.asyncDispose`, enabling `await using` declarations; see [[#websocketstream-closure]].
+
+{{ServerWebSocketStream}} is the server-side counterpart of the `WebSocketStream` interface [[WEBSOCKETSTREAM]], which has been proposed for the WebSockets Standard [[WEBSOCKETS]] but is not yet part of it. Each member of {{ServerWebSocketStream}} has the semantics of the like-named member of `WebSocketStream`, adapted to the server side of the connection, and {{WebSocketOpenInfo}} and {{WebSocketCloseInfo}} have the members of the like-named dictionaries. Because `WebSocketStream` is not yet standardized, this specification defines these semantics normatively ([[#sec-serverwebsocketstream]]). The differences are the [=server-side extensions=] {{ServerWebSocketStream/destroy()}} and `Symbol.asyncDispose`; the close codes that {{ServerWebSocketStream/close()}} accepts, which are those a server can send ([[#websocketstream-close-codes]]); and the errors with which abnormal closure rejects, which follow this specification's error model ([[#errors]]). Should [[WEBSOCKETS]] adopt `WebSocketStream`, this specification defers to its definitions of {{WebSocketOpenInfo}}, {{WebSocketCloseInfo}}, and the message semantics ([[#websocketstream-messages]]).
+
+Note: {{ServerWebSocketStream}} omits the client-only surface of `WebSocketStream`: the constructor, the `url` attribute (the URL is available as the {{ServerRequest/url}} of {{ServerContext/request}}), and the `signal` option for aborting the opening handshake.
+
+Note: Messages are carried by a {{ReadableStream}} and a {{WritableStream}} rather than by the iterable streams of [[ITER-STREAMS]], which carry only bytes: a WebSocket message is either text or binary, and a byte stream cannot preserve that distinction. A {{ReadableStream}} is async iterable, so messages can still be read with `for await`.
 
 The WebTransportSession interface {#idl-webtransportsession}
 ------------------------------------------------------------
@@ -667,7 +714,7 @@ Each [=exchange=] is in exactly one of five states. The state determines which c
 : <dfn export for="exchange">informational</dfn>
 :: At least one informational (1xx) response has been sent; no final response has begun.
 : <dfn export for="exchange">committed</dfn>
-:: A final response has begun: the handler returned a {{ServerResponse}} (for one created by {{ServerResponse/error()}}, the stream is reset instead; see [[#serverresponse-sending]]), or a tunnel was accepted via {{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}, or {{ConnectContext/upgradeWebTransport()}}.
+:: A final response has begun: the handler returned a {{ServerResponse}} (for one created by {{ServerResponse/error()}}, the stream is reset instead; see [[#serverresponse-sending]]), or a tunnel was accepted via {{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}, {{ConnectContext/upgradeWebSocketStream()}}, or {{ConnectContext/upgradeWebTransport()}}.
 : <dfn export for="exchange">denied</dfn>
 :: {{ServerContext/deny()}} was called. Terminal.
 : <dfn export for="exchange">aborted</dfn>
@@ -710,7 +757,7 @@ An exchange is <dfn export>response-capable</dfn> while it is [=exchange/open=] 
       <td>Allowed &rarr; [=exchange/committed=]</td>
       <td>Throws</td>
       <td>Throws</td>
-      <td>Rejects with the [=abort reason=]; {{ConnectContext/upgradeWebSocket()}} returns a closed {{WebSocket}}</td>
+      <td>Rejects with the [=abort reason=]; {{ConnectContext/upgradeWebSocket()}} returns a closed {{WebSocket}}, and {{ConnectContext/upgradeWebSocketStream()}} a {{ServerWebSocketStream}} whose {{ServerWebSocketStream/opened}} and {{ServerWebSocketStream/closed}} promises are rejected with the [=abort reason=]</td>
     </tr>
   </tbody>
 </table>
@@ -718,7 +765,7 @@ An exchange is <dfn export>response-capable</dfn> while it is [=exchange/open=] 
 The two failure behaviors are deliberate:
 
 *   **Deterministic misuse throws.** The [=exchange/informational=], [=exchange/committed=], and [=exchange/denied=] states are entered by the handler's own actions, so a violation is a programming error: the operation throws an `"InvalidStateError"` {{DOMException}}.
-*   **Races are inert.** The [=exchange/aborted=] state can be entered by the peer at any moment; a handler cannot reliably check-then-act against it. Synchronous operations are silently discarded rather than throwing. Promise-returning establishment methods reject with the [=abort reason=], and {{ConnectContext/upgradeWebSocket()}} returns a {{WebSocket}} that is already closed ([[#connectcontext-websocket]]).
+*   **Races are inert.** The [=exchange/aborted=] state can be entered by the peer at any moment; a handler cannot reliably check-then-act against it. Synchronous operations are silently discarded rather than throwing. Promise-returning establishment methods reject with the [=abort reason=]. {{ConnectContext/upgradeWebSocket()}} returns a {{WebSocket}} that is already closed ([[#connectcontext-websocket]]), and {{ConnectContext/upgradeWebSocketStream()}} returns a {{ServerWebSocketStream}} whose {{ServerWebSocketStream/opened}} and {{ServerWebSocketStream/closed}} promises are rejected with the [=abort reason=] ([[#connectcontext-websocketstream]]).
 
 Note: {{ServerContext/deny()}} is restricted to [=exchange/open=] because its default signal (`ERR_HTTP_REQUEST_REJECTED`) is a guarantee to the client that no processing occurred and the request may be safely retried &mdash; even for non-idempotent methods. Once anything has been sent, that guarantee would be false. The state model makes it structurally impossible to send it untruthfully.
 
@@ -1580,7 +1627,7 @@ On an [=upgrade-originated=] exchange, {{ConnectContext/accept()}} performs the 
 
 ### Routing ### {#connectcontext-upgrade-routing}
 
-*   If a `connect()` handler is provided, [=upgrade-originated=] exchanges are routed to it. The handler completes the upgrade ({{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}), refuses it (a non-2xx {{ServerResponse}}, or {{ServerContext/deny()}}), or declines only the upgrade offer via the [=fall-through sentinel=] ([[#connectcontext-fallthrough]]).
+*   If a `connect()` handler is provided, [=upgrade-originated=] exchanges are routed to it. The handler completes the upgrade ({{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}, {{ConnectContext/upgradeWebSocketStream()}}), refuses it (a non-2xx {{ServerResponse}}, or {{ServerContext/deny()}}), or declines only the upgrade offer via the [=fall-through sentinel=] ([[#connectcontext-fallthrough]]).
 *   If no `connect()` handler is provided, the upgrade offer is ignored, as [RFC 9110 Section 7.8](https://www.rfc-editor.org/rfc/rfc9110#section-7.8) permits: the request is routed to `fetch()` as an ordinary request. The `Upgrade` header remains visible there, but the handler cannot act on it.
 *   An implementation MAY instead handle particular upgrade protocols itself, without routing them to the application.
 
@@ -1594,7 +1641,7 @@ The <dfn method for="ConnectContext">accept(init)</dfn> method accepts the CONNE
 
 The optional |init| parameter allows setting header fields on the success response, through its {{ConnectAcceptInit/headers}} member. If |init|["{{ConnectAcceptInit/headers}}"] [=map/exists=], it is [=convert a headers init|converted=] to a [=/header list=], so an invalid name or value rejects the returned promise with a {{TypeError}}. The fields are sent subject to [[#serverheaders-outgoing]].
 
-Accepting commits the [=exchange=] ([=exchange/committed=]): subsequent calls to {{ConnectContext/accept()}}, the upgrade methods, or {{ServerContext/deny()}} throw an `"InvalidStateError"` {{DOMException}}, per [[#exchange-states]]. If the exchange is [=exchange/aborted=], the returned promise rejects with the [=abort reason=]. {{ConnectContext/upgradeWebSocket()}} and {{ConnectContext/upgradeWebTransport()}} are committing operations subject to the same rules.
+Accepting commits the [=exchange=] ([=exchange/committed=]): subsequent calls to {{ConnectContext/accept()}}, the upgrade methods, or {{ServerContext/deny()}} throw an `"InvalidStateError"` {{DOMException}}, per [[#exchange-states]]. If the exchange is [=exchange/aborted=], the returned promise rejects with the [=abort reason=]. {{ConnectContext/upgradeWebSocket()}}, {{ConnectContext/upgradeWebSocketStream()}}, and {{ConnectContext/upgradeWebTransport()}} are committing operations subject to the same rules.
 
 On [=upgrade-originated=] exchanges, accepting performs the HTTP/1.1 upgrade handshake instead of a CONNECT success response; see [[#connectcontext-upgrade]].
 </div>
@@ -1609,6 +1656,28 @@ If {{ConnectContext/connectProtocol}} is not `"websocket"`, this method throws a
 
 If the [=exchange=] is [=exchange/aborted=], this method does not throw ([[#exchange-states]]). It returns a {{WebSocket}} object whose connection closed abnormally: an `error` event and then a `close` event, with code 1006 and `wasClean` false, are fired at it, as for any WebSocket connection that closes without a closing handshake.
 </div>
+
+Note: A {{WebSocket}} provides no backpressure. Received messages are dispatched as `message` events as they arrive, with no way to pause them, and {{WebSocket/send()}} queues data without waiting for the transport. {{ConnectContext/upgradeWebSocketStream()}} establishes the same connection with backpressure in both directions.
+
+WebSocket stream upgrade {#connectcontext-websocketstream}
+----------------------------------------------------------
+
+<div algorithm>
+The <dfn method for="ConnectContext">upgradeWebSocketStream(options)</dfn> method establishes a WebSocket connection with the same handshake as {{ConnectContext/upgradeWebSocket()}}, including subprotocol negotiation if |options|.{{WebSocketUpgradeInit/protocol}} is provided, and returns a {{ServerWebSocketStream}} through which its messages are read and written as streams ([[#sec-serverwebsocketstream]]).
+
+<ol>
+<li>If {{ConnectContext/connectProtocol}} is not `"websocket"`, throw an `"InvalidStateError"` {{DOMException}}.
+<li>If the [=exchange=] is [=exchange/committed=] or [=exchange/denied=], or has fallen through to `fetch()` ([[#connectcontext-fallthrough]]), throw an `"InvalidStateError"` {{DOMException}}.
+<li>Let |stream| be a new {{ServerWebSocketStream}}.
+<li>If the [=exchange=] is [=exchange/aborted=], reject |stream|'s [=ServerWebSocketStream/opened promise=] and [=ServerWebSocketStream/closed promise=] with the [=abort reason=], and return |stream| ([[#exchange-states]]).
+<li>Set the exchange state to [=exchange/committed=], and send the WebSocket handshake response as {{ConnectContext/upgradeWebSocket()}} does, selecting a subprotocol from |options|.{{WebSocketUpgradeInit/protocol}} if it is provided. The WebSocket connection is now established ([RFC 6455 Section 4.2.2](https://www.rfc-editor.org/rfc/rfc6455#section-4.2.2)); messages sent on it follow the handshake response.
+<li>Set |stream|'s [=ServerWebSocketStream/readable stream=] and [=ServerWebSocketStream/writable stream=] to new streams for the connection ([[#websocketstream-messages]]).
+<li>Resolve |stream|'s [=ServerWebSocketStream/opened promise=] with a {{WebSocketOpenInfo}} whose {{WebSocketOpenInfo/readable}} and {{WebSocketOpenInfo/writable}} members are |stream|'s [=ServerWebSocketStream/readable stream=] and [=ServerWebSocketStream/writable stream=], whose {{WebSocketOpenInfo/protocol}} member is the subprotocol in use, and whose {{WebSocketOpenInfo/extensions}} member is the extensions in use (the empty string when there are none).
+<li>Return |stream|.
+</ol>
+</div>
+
+As with {{ConnectContext/upgradeWebSocket()}}, the connection is established before the method returns: on the server side, the opening handshake needs no reply from the client. The {{ServerWebSocketStream/opened}} promise is therefore already settled when the {{ServerWebSocketStream}} is returned. It is kept so that code written against `WebSocketStream` [[WEBSOCKETSTREAM]], such as `const { readable, writable } = await wss.opened`, works unchanged.
 
 WebTransport upgrade {#connectcontext-webtransport}
 ---------------------------------------------------
@@ -1825,6 +1894,152 @@ async connect(ctx) {
 Note: There is no `Symbol.dispose`: tunnel closure is inherently asynchronous, so {{Tunnel}} supports `await using` but not synchronous `using`.
 
 
+ServerWebSocketStream {#sec-serverwebsocketstream}
+==================================================
+
+A {{ServerWebSocketStream}} represents an established WebSocket connection ([RFC 6455](https://www.rfc-editor.org/rfc/rfc6455)) whose messages are read and written as streams. It is obtained via {{ConnectContext/upgradeWebSocketStream()}}, whether the connection was requested by an HTTP/1.1 upgrade or by extended CONNECT ([[#connectcontext-upgrade]]):
+
+```js
+async connect(ctx) {
+  if (ctx.connectProtocol !== 'websocket') {
+    return new ServerResponse(null, { status: 501 });
+  }
+  await using wss = ctx.upgradeWebSocketStream({ protocol: ['chat.v1'] });
+  const { readable, writable } = await wss.opened;
+  const writer = writable.getWriter();
+  for await (const message of readable) {
+    // The next message is not read until this one has been handled,
+    // and each write waits while the client is not keeping up.
+    await writer.write(await handle(message));
+  }
+  // Scope exit closes the connection and awaits closure.
+}
+```
+
+A {{ServerWebSocketStream}} has:
+
+*   an <dfn for="ServerWebSocketStream">opened promise</dfn>, a promise;
+*   a <dfn for="ServerWebSocketStream">closed promise</dfn>, a promise;
+*   a <dfn for="ServerWebSocketStream">readable stream</dfn>, a {{ReadableStream}} or null, initially null; and
+*   a <dfn for="ServerWebSocketStream">writable stream</dfn>, a {{WritableStream}} or null, initially null.
+
+Both promises are always [=mark as handled|marked as handled=], so a rejection the application never observes is not reported as unhandled. The streams are null only when the [=exchange=] was [=exchange/aborted=] before {{ConnectContext/upgradeWebSocketStream()}} was called.
+
+Opening {#websocketstream-opened}
+---------------------------------
+
+<div algorithm>
+The <dfn attribute for="ServerWebSocketStream">opened</dfn> attribute returns [=this=]'s [=ServerWebSocketStream/opened promise=]. The promise is settled before the {{ServerWebSocketStream}} is returned: fulfilled with the {{WebSocketOpenInfo}} for the connection, or rejected with the [=abort reason=] if the [=exchange=] was [=exchange/aborted=] ([[#connectcontext-websocketstream]]).
+</div>
+
+Messages {#websocketstream-messages}
+------------------------------------
+
+The [=ServerWebSocketStream/readable stream=] delivers the messages received from the peer. Each chunk is one message: a string for a text message, and a {{Uint8Array}} for a binary message. The stream is pull-based: the implementation enqueues a message only when the stream requests one. While messages are not being read, the implementation stops reading from the transport once it has buffered an implementation-defined amount, so that the flow control of the underlying connection (TCP, or the HTTP/2 or HTTP/3 stream) slows the peer. Backpressure applies between messages: each message is delivered whole, so an implementation MAY limit the size of a received message, failing the WebSocket connection with close code 1009 (Message Too Big) when a message exceeds it ([RFC 6455 Section 10.4](https://www.rfc-editor.org/rfc/rfc6455#section-10.4)). Cancelling the stream starts the closing handshake ([[#websocketstream-closure]]).
+
+The [=ServerWebSocketStream/writable stream=] sends messages to the peer. Each chunk written is sent as one message: a {{BufferSource}} as a binary message containing a copy of its bytes, and any other value, converted to a string, as a text message; if the conversion throws, the write rejects with the exception. A write waits until the implementation can accept the message, then sends it and resolves. The amount of data the implementation accepts before writes wait is implementation-defined and may follow the transport's flow-control window, as for a [=tunnel=]'s {{Tunnel/writer}} ([[#tunnel-raw]]), so the stream's backpressure &mdash; observable, for example, through the `ready` promise of a writer &mdash; reflects the peer's progress. A message written after the closing handshake has started is not sent, and its write still resolves. Closing or aborting the stream starts the closing handshake ([[#websocketstream-closure]]).
+
+Note: These are the message semantics of `WebSocketStream` [[WEBSOCKETSTREAM]]. A {{WebSocket}} cannot express them: it dispatches each message as it arrives, whether or not the application is ready for it.
+
+Closure {#websocketstream-closure}
+----------------------------------
+
+A WebSocket connection closes through the closing handshake of [RFC 6455 Section 7](https://www.rfc-editor.org/rfc/rfc6455#section-7): each endpoint sends a Close frame, which may carry a close code and a reason. Once the server has both sent and received a Close frame, the closing handshake is complete and the implementation closes the transport: on HTTP/1.1 it closes the connection, and on HTTP/2 and HTTP/3 it ends the stream, which is how those versions represent an orderly TCP-level close ([RFC 8441 Section 5](https://www.rfc-editor.org/rfc/rfc8441#section-5), [RFC 9220 Section 3](https://www.rfc-editor.org/rfc/rfc9220#section-3)). Closure is clean if the closing handshake completed, and abnormal otherwise.
+
+<table>
+  <thead>
+    <tr><th>Event</th><th>Effect</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>{{ServerWebSocketStream/close()}} is called, or the [=ServerWebSocketStream/writable stream=] is closed</td>
+      <td>The closing handshake starts: a Close frame is sent, carrying the close code and reason given to {{ServerWebSocketStream/close()}}, or no close code when the writable stream is closed</td>
+    </tr>
+    <tr>
+      <td>The [=ServerWebSocketStream/readable stream=] is cancelled, or the [=ServerWebSocketStream/writable stream=] is aborted</td>
+      <td>The closing handshake starts, with the close code and reason carried by the cancel or abort reason, if any (see below)</td>
+    </tr>
+    <tr>
+      <td>The peer sends a Close frame</td>
+      <td>The closing handshake starts, if it has not already: the implementation sends a Close frame in response ([RFC 6455 Section 5.5.1](https://www.rfc-editor.org/rfc/rfc6455#section-5.5.1)). The messages received before the peer's Close frame can still be read</td>
+    </tr>
+    <tr>
+      <td>The closing handshake completes and the transport is closed</td>
+      <td>Clean closure: the readable stream closes, after any messages already received have been read; the writable stream errors with an `"InvalidStateError"` {{DOMException}}; {{ServerWebSocketStream/closed}} fulfills with the peer's close code and reason</td>
+    </tr>
+    <tr>
+      <td>The peer resets the stream, or the connection is lost</td>
+      <td>Abnormal closure: the readable and writable streams error, and {{ServerWebSocketStream/closed}} rejects, with the [=protocol error=] ([[#errors-inbound]])</td>
+    </tr>
+    <tr>
+      <td>The transport is closed before the closing handshake completes, or the implementation fails the WebSocket connection ([RFC 6455 Section 7.1.7](https://www.rfc-editor.org/rfc/rfc6455#section-7.1.7)) &mdash; for example, because the peer violated the protocol</td>
+      <td>Abnormal closure, as above, with a [=protocol error=] whose code is `ERR_HTTP_CONNECT_ERROR`</td>
+    </tr>
+    <tr>
+      <td>{{ServerWebSocketStream/destroy()}} is called</td>
+      <td>Abnormal closure without a closing handshake: the stream is reset ([[#errors-outbound]])</td>
+    </tr>
+  </tbody>
+</table>
+
+<div algorithm>
+The <dfn method for="ServerWebSocketStream">close(closeInfo)</dfn> method starts the closing handshake:
+
+<ol>
+<li>Let |code| be |closeInfo|["{{WebSocketCloseInfo/closeCode}}"] if it [=map/exists=], and null otherwise.
+<li>Let |reason| be |closeInfo|["{{WebSocketCloseInfo/reason}}"].
+<li>[=Validate a server close code and reason=] given |code| and |reason|.
+<li>If the closing handshake has started, or the connection is closed, return.
+<li>If |reason| is not the empty string and |code| is null, set |code| to 1000 (Normal Closure).
+<li>Start the closing handshake ([RFC 6455 Section 7.1.2](https://www.rfc-editor.org/rfc/rfc6455#section-7.1.2)) by sending a Close frame after the messages already sent. If |code| is null, the Close frame has no body. Otherwise its status code is |code|, followed by the [=UTF-8 encode|UTF-8 encoding=] of |reason|.
+</ol>
+</div>
+
+Messages written to the [=ServerWebSocketStream/writable stream=] but not yet sent when {{ServerWebSocketStream/close()}} is called are discarded. To close after every written message has been sent, close the writable stream instead: its close takes effect after the writes queued before it.
+
+<div algorithm="ServerWebSocketStream cancel and abort">
+When the [=ServerWebSocketStream/readable stream=] is cancelled, or the [=ServerWebSocketStream/writable stream=] is aborted, with |reason|, the closing handshake starts as if {{ServerWebSocketStream/close()}} had been called with the result of converting |reason| to a {{WebSocketCloseInfo}}. If the conversion throws, or the {{ServerWebSocketStream/close()}} steps would throw, the Close frame has no body instead. A `WebSocketError` [[WEBSOCKETSTREAM]], or any object with `closeCode` and `reason` properties, therefore supplies the close code and reason; a reason without them, such as an `Error`, supplies none.
+</div>
+
+<div algorithm>
+The <dfn attribute for="ServerWebSocketStream">closed</dfn> attribute returns [=this=]'s [=ServerWebSocketStream/closed promise=]. On clean closure, the promise is fulfilled with a {{WebSocketCloseInfo}} whose {{WebSocketCloseInfo/closeCode}} is the status code of the first Close frame received from the peer, or 1005 (No Status Rcvd) if that frame had none, and whose {{WebSocketCloseInfo/reason}} is that frame's reason, decoded as UTF-8 ([RFC 6455 Sections 7.1.5 and 7.1.6](https://www.rfc-editor.org/rfc/rfc6455#section-7.1.5)). On abnormal closure, it is rejected with the error given in the table above.
+</div>
+
+As for {{Tunnel/close()}}, a peer that never completes the closing handshake is subject to the {{TimeoutOptions/tunnelIdle}} timeout ([[#serve-timeouts]]).
+
+<div algorithm>
+The <dfn method for="ServerWebSocketStream">destroy(error)</dfn> method immediately terminates the WebSocket connection, without a closing handshake:
+
+<ol>
+<li>If the connection is already closed, cleanly or abnormally, return.
+<li>Reset the stream, carrying the [=error code=] mapped from |error| per the tunnel abort mechanism ([[#errors-outbound]]); when |error| is omitted or carries no sendable code, `ERR_HTTP_REQUEST_CANCELLED` is used. On HTTP/1.1, the connection is closed.
+<li>Let |reason| be |error| if it was given, and a [=protocol error=] whose code is `ERR_HTTP_REQUEST_CANCELLED` otherwise.
+<li>Error the [=ServerWebSocketStream/readable stream=] and [=ServerWebSocketStream/writable stream=] with |reason|; pending reads and writes reject.
+<li>Reject the [=ServerWebSocketStream/closed promise=] with |reason|.
+</ol>
+
+The default is `ERR_HTTP_REQUEST_CANCELLED` rather than the `ERR_HTTP_CONNECT_ERROR` of {{Tunnel/destroy()}} because it is the signal that [RFC 8441 Section 5](https://www.rfc-editor.org/rfc/rfc8441#section-5) and [RFC 9220 Section 3](https://www.rfc-editor.org/rfc/rfc9220#section-3) assign to the abrupt closure of a WebSocket connection: RST_STREAM with CANCEL on HTTP/2, and H3_REQUEST_CANCELLED on HTTP/3. Like {{Tunnel/destroy()}}, {{ServerWebSocketStream/destroy()}} operates on the connection rather than through its streams: it remains effective while the streams are locked, and it short-circuits a closing handshake in progress.
+</div>
+
+{{ServerWebSocketStream}} supports `Symbol.asyncDispose`, enabling `await using` declarations, with the same disposal steps as {{Tunnel}}: if the connection is already closed, cleanly or abnormally, the disposal promise resolves with `undefined`; otherwise {{ServerWebSocketStream/close()}} is called with no arguments, and the promise settles as closure completes &mdash; fulfilled on clean closure, rejected if closure turns abnormal. As with {{Tunnel}}, there is no `Symbol.dispose`.
+
+Close codes {#websocketstream-close-codes}
+------------------------------------------
+
+<div algorithm>
+To <dfn>validate a server close code and reason</dfn> given |code| and |reason|:
+
+<ol>
+<li>If |code| is not null and is not in one of the ranges 1000&ndash;1003, 1007&ndash;1009, 1011&ndash;1014, or 3000&ndash;4999, inclusive, throw an `"InvalidAccessError"` {{DOMException}}.
+<li>If the [=UTF-8 encode|UTF-8 encoding=] of |reason| is longer than 123 bytes, throw a `"SyntaxError"` {{DOMException}}.
+</ol>
+</div>
+
+These are the close codes that a server can send: those defined by [RFC 6455 Section 7.4](https://www.rfc-editor.org/rfc/rfc6455#section-7.4) or registered in the [IANA WebSocket Close Code Number Registry](https://www.iana.org/assignments/websocket/websocket.xhtml#close-code-number), together with the ranges reserved for libraries, frameworks, applications, and private use. The codes excluded are reserved (1004); never sent in a Close frame (1005, 1006, and 1015); sent only by clients (1010); or reserved for future definition (1016&ndash;2999). The 123-byte limit keeps the Close frame's payload within the 125 bytes that a control frame allows.
+
+Note: This deliberately differs from `WebSocketStream` [[WEBSOCKETSTREAM]] and {{WebSocket}}, which accept only 1000 and 3000&ndash;4999 from script. On a server, the application is the endpoint, and codes such as 1001 (Going Away, for example on shutdown), 1008 (Policy Violation), 1009 (Message Too Big), 1011 (Internal Error), 1012 (Service Restart), and 1013 (Try Again Later) are its to send.
+
+
 WebTransport {#webtransport}
 ============================
 
@@ -1999,6 +2214,7 @@ Where each code may appear:
 *   Sendable by aborting a committed response ([[#errors-outbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR` (the default).
 *   Sendable by ending iteration of the request body early ([[#errors-outbound]]): `ERR_HTTP_REQUEST_BODY_REJECTED`.
 *   Sendable by failing a [=tunnel=]'s {{Tunnel/writer}} or calling {{Tunnel/destroy()}} ([[#errors-outbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_INTERNAL_ERROR`, `ERR_HTTP_CONNECT_ERROR` (the default).
+*   Sendable by calling {{ServerWebSocketStream/destroy()}} ([[#errors-outbound]]): `ERR_HTTP_REQUEST_CANCELLED` (the default), `ERR_HTTP_INTERNAL_ERROR`, `ERR_HTTP_CONNECT_ERROR`.
 *   Surfaced on request body iteration when a configured content limit is exceeded ([[#serve-limits]]): `ERR_HTTP_CONTENT_TOO_LARGE`.
 *   Surfaced on {{ServerRequest/trailers}} when the request body will not be read to its end ([[#serverrequest-trailers]]): `ERR_HTTP_REQUEST_BODY_REJECTED`.
 *   Observable inbound ([[#errors-inbound]]): `ERR_HTTP_REQUEST_CANCELLED`, `ERR_HTTP_STREAM_RESET`, `ERR_HTTP_PROTOCOL_ERROR`, `ERR_HTTP_GOAWAY`, `ERR_HTTP_CONNECT_ERROR`, `ERR_HTTP_CONNECTION_RESET`, `ERR_HTTP_TIMEOUT`.
@@ -2030,7 +2246,7 @@ A handler signals protocol-level errors to the client through five mechanisms:
 
 4.  **Request body refusal**: ending iteration of the request body before the body has ended ([[#serverrequest-body]]) signals that the server does not want the remainder of the upload &mdash; `STOP_SENDING` on HTTP/3, or `RST_STREAM` with NO_ERROR after a complete response on HTTP/2, per [RFC 9113 Section 8.1](https://www.rfc-editor.org/rfc/rfc9113#section-8.1). The response side of the exchange is unaffected. This is the outbound use of `ERR_HTTP_REQUEST_BODY_REJECTED`.
 
-5.  **Tunnel abort**: failing the {{Tunnel/writer}} of an established [=tunnel=], ending iteration of its {{Tunnel/readable}} (or of its {{CapsuleStream/readable}}) early, or calling {{Tunnel/destroy()}} terminates the tunnel abnormally and resets the stream. If the fail or destroy reason is a [=protocol error=] with a sendable code, that code is mapped to the wire; otherwise `ERR_HTTP_CONNECT_ERROR` is used, as it always is when iteration ends early, which carries no reason. See [[#tunnel-closure]]. {{WebTransportSession/destroy()}} terminates a WebTransport session the same way, by resetting its CONNECT stream ([[#webtransport-lifecycle]]).
+5.  **Tunnel abort**: failing the {{Tunnel/writer}} of an established [=tunnel=], ending iteration of its {{Tunnel/readable}} (or of its {{CapsuleStream/readable}}) early, or calling {{Tunnel/destroy()}} terminates the tunnel abnormally and resets the stream. If the fail or destroy reason is a [=protocol error=] with a sendable code, that code is mapped to the wire; otherwise `ERR_HTTP_CONNECT_ERROR` is used, as it always is when iteration ends early, which carries no reason. See [[#tunnel-closure]]. {{ServerWebSocketStream/destroy()}} terminates a WebSocket connection the same way, except that its default is `ERR_HTTP_REQUEST_CANCELLED`; cancelling or aborting the streams of a {{ServerWebSocketStream}} starts the WebSocket closing handshake instead of resetting the stream ([[#websocketstream-closure]]). {{WebTransportSession/destroy()}} terminates a WebTransport session the same way, by resetting its CONNECT stream ([[#webtransport-lifecycle]]).
 
 Inbound errors {#errors-inbound}
 --------------------------------
@@ -2046,8 +2262,9 @@ When the client resets the request stream or the connection is lost, the [=excha
     <tr><td>Iterating the request body</td><td>A pending or subsequent `next()` rejects with the protocol error</td></tr>
     <tr><td>{{ServerRequest/trailers}}</td><td>Rejects with the protocol error, if not already settled</td></tr>
     <tr><td>The body of the {{ServerResponse}} being sent</td><td>Reading stops, and the body is closed with the protocol error as the reason ([[#serverresponse-body]])</td></tr>
-    <tr><td>{{Tunnel/closed}} / {{WebTransportSession/closed}}</td><td>Rejects with the protocol error on abnormal termination</td></tr>
+    <tr><td>{{Tunnel/closed}} / {{ServerWebSocketStream/closed}} / {{WebTransportSession/closed}}</td><td>Rejects with the protocol error on abnormal termination</td></tr>
     <tr><td>A [=tunnel=]'s {{Tunnel/readable}}, {{Tunnel/writer}}, or {{CapsuleStream}}</td><td>A pending or subsequent iteration step rejects, and the writer errors (pending and subsequent writes and sends reject), with the protocol error</td></tr>
+    <tr><td>The streams of a {{ServerWebSocketStream}}</td><td>Both error with the protocol error; pending and subsequent reads and writes reject</td></tr>
     <tr><td>Pending {{ConnectContext/accept()}} or upgrade promises</td><td>Reject with the protocol error</td></tr>
   </tbody>
 </table>
@@ -2178,7 +2395,7 @@ Error handling {#handler-errors}
     <tr><td>`connect()` returns a {{ServerResponse}} before accepting</td><td>That response is sent</td></tr>
     <tr><td>`connect()` returns `undefined` after accept or deny</td><td>Normal completion</td></tr>
     <tr><td>`connect()` throws or rejects while [=response-capable=]</td><td>`error()` is invoked; fallback 502</td></tr>
-    <tr><td>`connect()` throws or rejects after accepting</td><td>Tunnel aborted; `ERR_HTTP_CONNECT_ERROR`</td></tr>
+    <tr><td>`connect()` throws or rejects after accepting</td><td>Tunnel aborted; `ERR_HTTP_CONNECT_ERROR`, or, for a WebSocket connection established by {{ConnectContext/upgradeWebSocket()}} or {{ConnectContext/upgradeWebSocketStream()}}, `ERR_HTTP_REQUEST_CANCELLED`, as for {{ServerWebSocketStream/destroy()}}</td></tr>
     <tr><td>`error()` throws, rejects, or returns an invalid value</td><td>Default 500/502; no re-entry</td></tr>
     <tr><td>[=Exchange=] is [=exchange/aborted=] (client gone)</td><td>Handler outcome discarded; `error()` not invoked</td></tr>
     <tr><td>{{ServerContext/waitUntil()}} promise rejects</td><td>Reported by the implementation; response unaffected</td></tr>
@@ -2425,8 +2642,8 @@ Activity timeouts are configured through the {{ServerOptions/timeouts}} member o
     <tr>
       <td>{{TimeoutOptions/tunnelIdle}}</td>
       <td>tunnel / session</td>
-      <td>An established [=tunnel=] or {{WebTransportSession}} has no data flowing in either direction</td>
-      <td>{{Tunnel/destroy()}} (or {{WebTransportSession/destroy()}}) with a [=protocol error=] whose code is `ERR_HTTP_TIMEOUT`</td>
+      <td>An established [=tunnel=] (including a WebSocket connection) or {{WebTransportSession}} has no data flowing in either direction</td>
+      <td>{{Tunnel/destroy()}} (or {{ServerWebSocketStream/destroy()}}, or {{WebTransportSession/destroy()}}) with a [=protocol error=] whose code is `ERR_HTTP_TIMEOUT`. The connection of a {{WebSocket}} returned by {{ConnectContext/upgradeWebSocket()}} is reset as by {{ServerWebSocketStream/destroy()}}, and the {{WebSocket}} closes abnormally, as in [[#connectcontext-websocket]]</td>
     </tr>
     <tr>
       <td>{{TimeoutOptions/waitUntil}}</td>
@@ -2674,7 +2891,7 @@ Security considerations {#security}
 
 *   **Header Filtering**: {{ServerHeaders}} applies none of the Fetch Standard's browser guards, so a handler can read `Cookie` and set `Set-Cookie`. Header names and values are still validated, which prevents header injection and response splitting ([[#serverheaders-model]]). Connection-specific and pseudo-header fields are not exposed to handlers ([[#serverrequest-attributes]]). The implementation controls the connection-specific fields and framing of what it sends ([[#serverheaders-outgoing]]). Fields with a [=prohibited trailer name=] are removed from request trailers and are not sent in response trailers ([[#serverheaders-trailers]]).
 
-*   **Tunnel Security**: The `connect()` handler establishes tunnels that can carry arbitrary traffic. Applications must perform their own authorization before calling {{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}, or {{ConnectContext/upgradeWebTransport()}}.
+*   **Tunnel Security**: The `connect()` handler establishes tunnels that can carry arbitrary traffic. Applications must perform their own authorization before calling {{ConnectContext/accept()}}, {{ConnectContext/upgradeWebSocket()}}, {{ConnectContext/upgradeWebSocketStream()}}, or {{ConnectContext/upgradeWebTransport()}}.
 
 *   **Denial of Service**: WebTransport sessions can open many streams; implementations should impose limits. {{ServerContext/waitUntil()}} extends request lifetime; implementations should impose timeouts. The Capsule Protocol and datagrams can generate high throughput; implementations should apply flow control.
 
