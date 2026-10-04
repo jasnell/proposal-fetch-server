@@ -196,6 +196,8 @@ An implementation that does not support an optional feature MUST still expose th
 
 {{ServerContext/deny()}} and {{ServerContext/waitUntil()}} are not optional. Every implementation can decline a request; the wire-level fidelity of [=error codes=] varies by protocol, and where a signal is unavailable the implementation uses the closest supported behavior (e.g., the HTTP/1.1 fallback in [[#servercontext-denial]]). Applications rely on {{ServerContext/waitUntil()}} for cleanup and logging actions that must complete, so every implementation MUST honor it (subject to the time limit in [[#servercontext-lifecycle]]).
 
+A conforming implementation MAY provide non-standard extensions: interfaces, attributes, methods, and dictionary members beyond those this specification defines. These include additional members on the objects it defines (such as {{ServerContext}}, {{ServerRequest}}, {{ServerResponse}}, and {{Server}}), additional options in its dictionaries (such as {{ServerOptions}} and {{ServerResponseInit}}), and additional handler methods on the handler object, for example for events other than HTTP exchanges. An extension MUST NOT contradict, or cause the non-conformance of, any behavior this specification defines. Within that limit, the presence of an extension does not make an implementation non-conforming, and this specification's definitions are not to be read as forbidding members or options that they do not mention.
+
 Normative references {#normative-references}
 =============================================
 
