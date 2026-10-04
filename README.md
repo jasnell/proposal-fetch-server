@@ -162,7 +162,7 @@ npm test
 
 | Specification | Relationship |
 |--------------|-------------|
-| [Fetch Standard](https://fetch.spec.whatwg.org/) | `ServerRequest`, `ServerResponse`, and `ServerHeaders` are modeled on `Request`, `Response`, and `Headers`, and reuse Fetch's concepts and algorithms where the behavior is the same, without depending on those interfaces. Assumes an `onInformation` callback for client-side `fetch()`. |
+| [Fetch Standard](https://fetch.spec.whatwg.org/) | `ServerRequest`, `ServerResponse`, and `ServerHeaders` are modeled on `Request`, `Response`, and `Headers`, and reuse Fetch's concepts and algorithms where the behavior is the same, without depending on those interfaces. The `trailers` members follow those proposed in [whatwg/fetch#1940](https://github.com/whatwg/fetch/pull/1940) and [#1941](https://github.com/whatwg/fetch/pull/1941), and `sendInformational()` is the server-side counterpart of the `onInformation` callback proposed in [whatwg/fetch#1942](https://github.com/whatwg/fetch/pull/1942). |
 | [Streams Standard](https://streams.spec.whatwg.org/) | A `ReadableStream` is accepted as a `ServerResponse` body; the WebTransport stream types used by `WebTransportSession` are built on it. |
 | [Iterable Streams API](https://iter-streams.proposal.wintertc.org/) | Request and response bodies are async iterables of batched `Uint8Array` chunks. A `Tunnel` has the shape of a `DuplexChannel`: tunnel data and datagrams are read as `ByteReadableStream`s and written through `Writer`s. |
 | [WebTransport](https://w3c.github.io/webtransport/) | `WebTransportSession` strictly follows the W3C WebTransport API's types (`WebTransportDatagramDuplexStream`, `WebTransportBidirectionalStream`, etc.); they are referenced, not duplicated. |

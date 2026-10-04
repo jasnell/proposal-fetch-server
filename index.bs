@@ -54,6 +54,27 @@ spec:dom; type:dfn; text:signal abort
     "title": "The WebSocketStream Interface (WebSockets Standard pull request #48)",
     "publisher": "WHATWG",
     "status": "Pull Request"
+  },
+  "FETCH-TRAILERS": {
+    "authors": ["James M Snell"],
+    "href": "https://github.com/whatwg/fetch/pull/1940",
+    "title": "Add .trailers to Response/Request (Fetch Standard pull request #1940)",
+    "publisher": "WHATWG",
+    "status": "Pull Request"
+  },
+  "FETCH-SEND-TRAILERS": {
+    "authors": ["James M Snell"],
+    "href": "https://github.com/whatwg/fetch/pull/1941",
+    "title": "Sending trailers (Fetch Standard pull request #1941)",
+    "publisher": "WHATWG",
+    "status": "Pull Request"
+  },
+  "FETCH-ONINFORMATION": {
+    "authors": ["James M Snell"],
+    "href": "https://github.com/whatwg/fetch/pull/1942",
+    "title": "Add onInformation interim response support (Fetch Standard pull request #1942)",
+    "publisher": "WHATWG",
+    "status": "Pull Request"
   }
 }
 </pre>
@@ -110,7 +131,7 @@ This specification defines a server-side API inspired by fetch that:
 
 <h3 class="no-num" id="related-specs">Relationship to Existing Specifications</h3>
 
-*   [Fetch Standard](https://fetch.spec.whatwg.org/): {{ServerRequest}}, {{ServerResponse}}, and {{ServerHeaders}} are modeled on the Fetch Standard's {{Request}}, {{Response}}, and {{Headers}}, and this specification uses the Fetch Standard's concepts and algorithms &mdash; such as header lists, status codes, and the encodings of non-streaming bodies &mdash; where the behavior is the same. It does not depend on the {{Request}}, {{Response}}, or {{Headers}} interfaces themselves. It assumes that `fetch()` supports an `onInformation` callback for receiving informational responses on the client side.
+*   [Fetch Standard](https://fetch.spec.whatwg.org/): {{ServerRequest}}, {{ServerResponse}}, and {{ServerHeaders}} are modeled on the Fetch Standard's {{Request}}, {{Response}}, and {{Headers}}, and this specification uses the Fetch Standard's concepts and algorithms &mdash; such as header lists, status codes, and the encodings of non-streaming bodies &mdash; where the behavior is the same. It does not depend on the {{Request}}, {{Response}}, or {{Headers}} interfaces themselves. Two of its features have client-side counterparts that are proposed for the Fetch Standard but are not yet part of it: trailer fields, through the `trailers` members of {{Request}}, {{Response}}, `RequestInit`, and `ResponseInit` [[FETCH-TRAILERS]] [[FETCH-SEND-TRAILERS]], which {{ServerRequest/trailers}}, {{ServerResponse/trailers}}, and {{ServerResponseInit/trailers}} follow; and informational responses, through an `onInformation` callback for `fetch()` [[FETCH-ONINFORMATION]], which receives what {{ServerContext/sendInformational()}} sends.
 *   [Streams Standard](https://streams.spec.whatwg.org/): a {{ReadableStream}} is accepted as the body of a {{ServerResponse}}, the messages of a {{ServerWebSocketStream}} are read from a {{ReadableStream}} and written to a {{WritableStream}}, and the [[WEBTRANSPORT]] stream types used by {{WebTransportSession}} are built on this standard.
 *   [Iterable Streams API](https://iter-streams.proposal.wintertc.org/) [[ITER-STREAMS]]: the bodies of a {{ServerRequest}} and a {{ServerResponse}} are async iterables of batched {{Uint8Array}} chunks, following that specification's stream model. A {{Tunnel}} has the shape of its {{DuplexChannel}}: tunnel data and datagrams are read as {{ByteReadableStream}}s and written through {{Writer}}s.
 *   [WebSockets Standard](https://websockets.spec.whatwg.org/) [[WEBSOCKETS]]: {{ConnectContext/upgradeWebSocket()}} returns the {{WebSocket}} interface it defines. {{ServerWebSocketStream}} is modeled on the `WebSocketStream` interface proposed for that standard [[WEBSOCKETSTREAM]], which is not yet part of it ([[#idl-serverwebsocketstream]]).
@@ -886,7 +907,17 @@ Notable informational status codes:
 
 An implementation that does not support informational responses throws a `"NotSupportedError"` {{DOMException}} rather than silently discarding the call: a swallowed 1xx would misrepresent observable protocol behavior that applications depend on, such as `Expect: 100-continue` flows and Early Hints preloading.
 
-Note: The Fetch Standard's `onInformation` callback (in `fetch()` options) is the client-side counterpart: it receives informational responses. {{ServerContext/sendInformational()}} is the server-side counterpart: it sends them.
+Note: The `onInformation` callback that [[FETCH-ONINFORMATION]] proposes for `fetch()` is the client-side counterpart of {{ServerContext/sendInformational()}}. It is invoked with the status code and header fields of each informational response that the client receives, the two values that {{ServerContext/sendInformational()}} takes.
+
+A {{Headers}} object is accepted as a {{ServerHeadersInit}}, so a handler that forwards a request with `fetch()` can relay the Early Hints it receives:
+
+```js
+const upstream = await fetch(originURL, {
+  onInformation(status, headers) {
+    if (status === 103) ctx.sendInformational(status, headers);
+  },
+});
+```
 
 ### 100 Continue ### {#servercontext-100-continue}
 
@@ -1040,7 +1071,7 @@ Trailers {#serverrequest-trailers}
 ----------------------------------
 
 <div algorithm>
-The <dfn attribute for="ServerRequest">trailers</dfn> attribute returns a promise for the request's trailer fields.
+The <dfn attribute for="ServerRequest">trailers</dfn> attribute returns a promise for the request's trailer fields. It returns the same promise every time.
 
 <ul>
 <li>The promise is fulfilled with a {{ServerHeaders}} object containing the trailer fields once the body has been read to its end ([[#serverrequest-body]]), or, for a request without a body, once the request has been received. The object's [=ServerHeaders/mutability=] is "`immutable`", and fields with a [=prohibited trailer name=] are removed from its [=ServerHeaders/header list=] ([[#serverheaders-trailers]]). If no trailer fields remain, the header list is empty.
@@ -1050,6 +1081,8 @@ The <dfn attribute for="ServerRequest">trailers</dfn> attribute returns a promis
 
 The promise is always [=mark as handled|marked as handled=], so a rejection the application never observes is not reported as unhandled.
 </div>
+
+Note: This is how the `trailers` attribute that [[FETCH-TRAILERS]] proposes behaves for a {{Response}} obtained from `fetch()`: the promise is fulfilled only once the body has been read to its end. Because an [=exchange=] always ends, the promise here does not stay pending when the body is never read; it is rejected.
 
 The body {#serverrequest-body}
 ------------------------------
@@ -1160,7 +1193,7 @@ To <dfn>initialize a server response</dfn>, given a {{ServerResponse}} |response
 </ol>
 </div>
 
-These steps follow those that the Fetch Standard defines for initializing a `Response`, with the trailer fields added.
+These steps follow those that the Fetch Standard defines for initializing a `Response`, with the trailer fields added as [[FETCH-SEND-TRAILERS]] proposes.
 
 <div algorithm>
 The static <dfn method for="ServerResponse">error()</dfn> method steps are:
@@ -1395,16 +1428,24 @@ async fetch(ctx) {
 }
 ```
 
-<div algorithm>
-The <dfn attribute for="ServerResponse">trailers</dfn> attribute returns a promise for the response's trailer fields:
+<div algorithm="ServerResponse trailers">
+A {{ServerResponse}} has a <dfn for="ServerResponse">trailers promise</dfn>, null or a promise, initially null.
 
-<ul>
-<li>Once [=this=]'s [=ServerResponse/trailer state=]'s [=trailer state/state=] is "`complete`", the promise is fulfilled with the result of [=create a server headers object|creating a server headers object=] in [=this=]'s [=relevant realm=], given a copy of the trailer state's [=trailer state/header list=] and "`immutable`".
-<li>Once it is "`errored`", the promise is rejected with the trailer state's [=trailer state/error=].
-</ul>
+The <dfn attribute for="ServerResponse">trailers</dfn> getter steps are:
 
-The promise is always [=mark as handled|marked as handled=], so a rejection the application never observes is not reported as unhandled.
+<ol>
+<li>If [=this=]'s [=ServerResponse/trailers promise=] is null, set it to [=a new promise=] in [=this=]'s [=relevant realm=], to be settled as follows:
+    <ul>
+    <li>Once [=this=]'s [=ServerResponse/trailer state=]'s [=trailer state/state=] is "`complete`", the promise is fulfilled with the result of [=create a server headers object|creating a server headers object=] in [=this=]'s [=relevant realm=], given a copy of the trailer state's [=trailer state/header list=] and "`immutable`".
+    <li>Once it is "`errored`", the promise is rejected with the trailer state's [=trailer state/error=].
+    </ul>
+<li>Return [=this=]'s [=ServerResponse/trailers promise=].
+</ol>
+
+If the trailer state has already left "`pending`" when the promise is created, the promise is settled at once. The promise is always [=mark as handled|marked as handled=], so a rejection the application never observes is not reported as unhandled. A clone gets a promise of its own, settled from the trailer state it shares ([[#serverresponse-clone]]).
 </div>
+
+Note: These trailer fields follow those that [[FETCH-SEND-TRAILERS]] proposes for the Fetch Standard's {{Response}}. The {{ServerResponseInit/trailers}} member is a promise for the fields, and fields not declared in `Trailer` are dropped. A response created without that member has no trailer fields, a clone shares the trailer state, and the {{ServerResponse/trailers}} getter returns the same promise every time. Where the Fetch Standard applies its header guard, this specification instead keeps fields with a [=prohibited trailer name=] from being sent ([[#serverheaders-trailers]]). A {{Headers}} object is accepted as a {{ServerHeadersInit}}, so the `trailers` promise of a {{Response}} obtained from `fetch()` [[FETCH-TRAILERS]] can be given as {{ServerResponseInit/trailers}} when relaying that response.
 
 Cloning {#serverresponse-clone}
 -------------------------------
