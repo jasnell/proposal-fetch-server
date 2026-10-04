@@ -2,8 +2,8 @@
 
 **Date:** July 2026
 
-This is a **proposal** for a server-side HTTP API built on the Fetch Standard's `Request` and
-`Response` types. It is intended for standardization through ECMA TC55 (WinterTC).
+This is a **proposal** for a server-side HTTP API modeled on the Fetch Standard. It is intended for
+standardization through ECMA TC55 (WinterTC).
 
 This is a **work in progress** and should not be considered a final design.
 The API and specification are evolving as we explore design tradeoffs and gather feedback.
@@ -17,7 +17,10 @@ priority.
 
 This specification defines a server-side API that closes those gaps:
 
-* Uses standard `Request` and `Response` without modification.
+* Defines `ServerRequest`, `ServerResponse`, and `ServerHeaders` for the HTTP messages a server
+  receives and sends. They follow the shape of Fetch's `Request`, `Response`, and `Headers` where
+  the behavior is the same, leave out client-only state and browser restrictions, and expose
+  bodies as [iterable streams](https://iter-streams.proposal.wintertc.org/).
 * Introduces a `ServerContext` for connection metadata, server capabilities, and lifecycle.
 * Unifies HTTP/1.1, HTTP/2, and HTTP/3 behind one programming model.
 * Handles both request/response exchanges and tunnel protocols (extended CONNECT).
@@ -25,15 +28,17 @@ This specification defines a server-side API that closes those gaps:
 
 ## Design Principles
 
-### P1: Standard Fetch Types Without Extension
+### P1: Message Types Built for Servers
 
-The `Request` a handler receives is a `Request`. The `Response` a handler returns is a `Response`.
-No duck-typing, no structural compatibility concerns, no server-specific subtypes.
-`ctx.request instanceof Request` is `true`. Proxying is `return fetch(ctx.request)`.
+The request a handler receives is a `ServerRequest`, and the response it returns is a
+`ServerResponse`; both carry their header fields in `ServerHeaders`. They have no client-only
+state, such as `mode`, `credentials`, `cache`, or `redirect`, and none of the browser restrictions
+on header fields. Where Fetch's `Request`, `Response`, or `Headers` has a member with the same
+meaning, these types keep its name and behavior.
 
 ### P2: Clean Separation of Message and Environment
 
-The HTTP message (`Request`) is separate from the server processing environment (`ServerContext`).
+The HTTP message (`ServerRequest`) is separate from the server processing environment (`ServerContext`).
 Connection metadata, lifecycle management, and server capabilities are properties of the context,
 not the request.
 
@@ -44,8 +49,8 @@ Protocol-version-specific behavior is the implementation's concern, not the appl
 
 ### P4: Incremental Adoption
 
-A handler that ignores the context and uses only `Request` and `Response` works unchanged.
-Server-specific capabilities are available when needed but never required.
+A handler that reads only `ctx.request` and returns a `ServerResponse` needs nothing else from the
+context. Server-specific capabilities are available when needed but never required.
 
 ### P5: Portability Across Runtimes
 
@@ -56,8 +61,7 @@ imperative `serve()`.
 ### P6: Extensibility for Future Protocols
 
 Extended CONNECT is designed to carry new protocols. The handler model accommodates new
-`:protocol` values without API changes and allows for entirely new handlers (e.g., `socket()`
-for raw TCP) to be defined.
+`:protocol` values without API changes and allows for entirely new handlers to be defined.
 
 ## Quick Example
 
@@ -76,15 +80,19 @@ export default {
       });
     }
 
-    // Proxy a request — ctx.request is a standard Request
-    if (url.pathname.startsWith('/proxy/')) {
-      return fetch(ctx.request);
+    // Read the body: a ServerRequest is an async iterable of Uint8Array batches
+    if (request.method === 'POST' && url.pathname === '/upload') {
+      let size = 0;
+      for await (const chunks of request) {
+        for (const chunk of chunks) size += chunk.byteLength;
+      }
+      return ServerResponse.json({ received: size });
     }
 
     // Background work after response
     ctx.waitUntil(logRequest(request));
 
-    return new Response("Hello!");
+    return new ServerResponse("Hello!");
   },
 
   async connect(ctx) {
@@ -102,7 +110,7 @@ export default {
         return;
       }
       default:
-        return new Response(null, { status: 501 });
+        return new ServerResponse(null, { status: 501 });
     }
   },
 };
@@ -114,11 +122,12 @@ The specification has two layers:
 
 | Layer | What it covers | Required? |
 |-------|---------------|-----------|
-| **Core** (handler model) | `ServerContext`, `ConnectContext`, handler object pattern, callback signatures | MUST implement |
+| **Core** (handler model) | `ServerContext`, `ServerRequest`, `ServerResponse`, `ServerHeaders`, `ConnectContext`, handler object pattern, callback signatures | MUST implement |
 | **Infrastructure** (server lifecycle) | `serve()`, `Server`, `Listener`, `Closeable`, options dictionaries | MAY implement |
 
-Cloudflare Workers would implement the core layer only (the application exports a handler object;
-the platform handles everything else). Node.js and Deno would implement both layers.
+Where the platform owns the server (the application exports a handler object and the platform
+handles everything else), an implementation would provide the core layer alone. Where applications
+create and manage their own servers, an implementation would typically provide both layers.
 
 ## Specification
 
@@ -153,8 +162,9 @@ npm test
 
 | Specification | Relationship |
 |--------------|-------------|
-| [Fetch Standard](https://fetch.spec.whatwg.org/) | `Request`, `Response`, `Headers`, `Body` definitions. Assumes trailer support and `onInformation` callback. |
-| [Streams Standard](https://streams.spec.whatwg.org/) | `ReadableStream` and `WritableStream` for bodies, tunnels, capsules, datagrams. `ReadableWritablePair` is the base of `CapsuleStream` and `DatagramStream`. |
+| [Fetch Standard](https://fetch.spec.whatwg.org/) | `ServerRequest`, `ServerResponse`, and `ServerHeaders` are modeled on `Request`, `Response`, and `Headers`, and reuse Fetch's concepts and algorithms where the behavior is the same, without depending on those interfaces. Assumes an `onInformation` callback for client-side `fetch()`. |
+| [Streams Standard](https://streams.spec.whatwg.org/) | A `ReadableStream` is accepted as a `ServerResponse` body; the WebTransport stream types used by `WebTransportSession` are built on it. |
+| [Iterable Streams API](https://iter-streams.proposal.wintertc.org/) | Request and response bodies are async iterables of batched `Uint8Array` chunks. A `Tunnel` has the shape of a `DuplexChannel`: tunnel data and datagrams are read as `ByteReadableStream`s and written through `Writer`s. |
 | [WebTransport](https://w3c.github.io/webtransport/) | `WebTransportSession` strictly follows the W3C WebTransport API's types (`WebTransportDatagramDuplexStream`, `WebTransportBidirectionalStream`, etc.); they are referenced, not duplicated. |
 | [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) | HTTP semantics (trailers, informational responses). |
 | [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218) | Extensible Prioritization Scheme. |
