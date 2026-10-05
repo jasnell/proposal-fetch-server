@@ -186,11 +186,11 @@ Scope {#scope}
 
 This proposal defines the [=Fetch Server API=], a server-side HTTP API modeled on the Fetch Standard. It specifies:
 
-*   A {{ServerContext}} interface providing connection metadata, server capabilities, and lifecycle management for incoming HTTP requests.
-*   A {{ServerRequest}} interface representing the incoming HTTP request message, whose body is consumed as an iterable stream [[ITER-STREAMS]].
+*   A {{ServerContext}} object protocol providing connection metadata, server capabilities, and lifecycle management for incoming HTTP requests.
+*   A {{ServerRequest}} object protocol representing the incoming HTTP request message, whose body is consumed as an iterable stream [[ITER-STREAMS]].
 *   A {{ServerResponse}} interface representing the HTTP response message a handler returns, including its trailer fields.
-*   A {{ServerHeaders}} interface for the header fields and trailer fields of those messages, without the browser restrictions of the Fetch Standard's {{Headers}}.
-*   A {{ConnectContext}} interface extending {{ServerContext}} for CONNECT and extended CONNECT tunnel protocols.
+*   A {{ServerHeaders}} object protocol for the header fields and trailer fields of those messages, without the browser restrictions of the Fetch Standard's {{Headers}}.
+*   A {{ConnectContext}} object protocol extending {{ServerContext}} for CONNECT and extended CONNECT tunnel protocols.
 *   An [=exchange=] state model governing response commitment, and an [=error code=] registry mapping protocol-version-independent codes to HTTP/2 and HTTP/3 error signals.
 *   A {{Tunnel}} interface for bidirectional communication over established HTTP tunnels, read and written as iterable streams [[ITER-STREAMS]], including the Capsule Protocol and HTTP Datagrams.
 *   A {{ServerWebSocketStream}} interface for WebSocket connections whose messages are read and written as streams, with backpressure.
@@ -204,6 +204,8 @@ Conformance {#conformance}
 This specification has two layers:
 
 **Core** (handler model): The {{ServerContext}}, {{ServerRequest}}, {{ServerResponse}}, {{ServerHeaders}}, {{ConnectContext}}, handler object pattern, and the handler callback signatures. A conforming implementation MUST support this layer.
+
+The objects of this specification are of two kinds. Objects that the implementation supplies to application code, and that application code may wrap, delegate, or substitute, are defined as object protocols: {{ServerContext}}, {{ConnectContext}}, {{ServerRequest}}, and {{ServerHeaders}}. An implementation never receives them back, so nothing depends on their identity. Objects that application code creates and hands to the implementation, such as {{ServerResponse}}, and objects that represent transport resources, such as {{Tunnel}}, {{ServerWebSocketStream}}, {{WebTransportSession}}, {{Server}}, and {{Listener}}, are Web IDL interfaces.
 
 **Infrastructure** (server lifecycle): The `serve()` function, {{Server}}, {{Listener}}, {{Closeable}}, {{ListenOptions}}, {{ServerOptions}}, and {{TLSOptions}}. An implementation MAY support this layer. An implementation that manages server lifecycle externally (e.g., an edge runtime where binding, TLS, and connection management are handled by the platform outside the application) is not required to expose `serve()`, {{Server}}, or {{Listener}}. Such an implementation is conforming as long as it implements the core layer.
 
@@ -325,18 +327,18 @@ Callback definitions {#idl-callbacks}
 <pre class="idl">
 callback PriorityCallback = undefined (optional RequestPriority priority = {});
 
-callback FetchHandler = any (ServerContext ctx);
+callback FetchHandler = any (object ctx);
 
-callback ConnectHandler = any (ConnectContext ctx);
+callback ConnectHandler = any (object ctx);
 
-callback ErrorHandler = any (ServerContext ctx, any error);
+callback ErrorHandler = any (object ctx, any error);
 </pre>
 
-The {{FetchHandler}} callback receives a {{ServerContext}} and returns a {{ServerResponse}}, `undefined`, or a {{Promise}} resolving to one of those. The return type is specified as `any` because Web IDL cannot express `(ServerResponse or undefined or Promise<ServerResponse or undefined>)` as a callback return type.
+The {{FetchHandler}} callback receives a {{ServerContext}} and returns a {{ServerResponse}}, `undefined`, or a {{Promise}} resolving to one of those. The return type is specified as `any` because Web IDL cannot express `(ServerResponse or undefined or Promise<ServerResponse or undefined>)` as a callback return type. The context argument is typed `object` because {{ServerContext}} and {{ConnectContext}} are object protocols ([[#idl-servercontext]]).
 
 The {{ConnectHandler}} callback receives a {{ConnectContext}} and returns a {{ServerResponse}}, `undefined`, or a {{Promise}} resolving to one of those.
 
-The {{ErrorHandler}} callback receives the context of a failed [=exchange=] (a {{ServerContext}} or {{ConnectContext}}) and the thrown value, and returns a {{ServerResponse}}, `undefined`, or a {{Promise}} resolving to one of those. See [[#handler-error]].
+The {{ErrorHandler}} callback receives the context of a failed [=exchange=] (a {{ServerContext}} or {{ConnectContext}}) and the thrown value, and returns a {{ServerResponse}}, `undefined`, or a {{Promise}} resolving to one of those. See [[#handler-error]]. Because there are no `ServerContext` or `ConnectContext` classes, an `error()` handler that serves both kinds of exchange tells them apart by their properties, for example with `'accept' in ctx`.
 
 Options dictionaries {#idl-options}
 -----------------------------------
@@ -519,56 +521,90 @@ Each method converts its `name` and `value` arguments to byte strings as Web IDL
 
 A {{ServerHeadersInit}} has the same form as the Fetch Standard's `HeadersInit`: a sequence of name/value pairs, or a record of names to values. Any iterable of name/value pairs is accepted as a sequence, so a {{ServerHeaders}} object or a {{Headers}} object can be used as one.
 
-The ServerContext interface {#idl-servercontext}
-------------------------------------------------
+The ServerContext protocol {#idl-servercontext}
+-----------------------------------------------
 
-<pre class="idl">
-[Exposed=*]
-interface ServerContext {
-  [SameObject] readonly attribute object request;
+A <dfn interface>ServerContext</dfn> is an object, supplied by the implementation, that is the server-side processing environment for an incoming HTTP request. It provides the {{ServerRequest}}, connection metadata, server capabilities, and lifecycle management.
 
-  readonly attribute object remoteAddress;
-  readonly attribute object localAddress;
-  readonly attribute DOMString alpnProtocol;
-  readonly attribute boolean encrypted;
-  readonly attribute DOMString? serverName;
+Like {{ServerRequest}}, {{ServerContext}} is an object protocol rather than a Web IDL interface ([[#idl-serverrequest]]): there is no `ServerContext` global and no constructor, and `instanceof` checks against it are not possible. An object is a {{ServerContext}} if it has the following properties, as own or inherited properties:
 
-  readonly attribute object clientPriority;
-  attribute object? serverPriority;
-  attribute PriorityCallback? onpriority;
+<table class="data">
+  <thead><tr><th>Property</th><th>Kind</th><th>Value or behavior</th></tr></thead>
+  <tbody>
+    <tr><td>`request`</td><td>read-only</td><td>A {{ServerRequest}}; the same object on every get ({{ServerContext/request}})</td></tr>
+    <tr><td>`remoteAddress`, `localAddress`</td><td>read-only</td><td>A {{SocketAddress}}, as a new object on every get ({{ServerContext/remoteAddress}}, {{ServerContext/localAddress}})</td></tr>
+    <tr><td>`alpnProtocol`</td><td>read-only</td><td>A String ({{ServerContext/alpnProtocol}})</td></tr>
+    <tr><td>`encrypted`</td><td>read-only</td><td>A Boolean ({{ServerContext/encrypted}})</td></tr>
+    <tr><td>`serverName`</td><td>read-only</td><td>A String or `null` ({{ServerContext/serverName}})</td></tr>
+    <tr><td>`clientPriority`</td><td>read-only</td><td>A {{RequestPriority}}, as a new object on every get ({{ServerContext/clientPriority}})</td></tr>
+    <tr><td>`serverPriority`</td><td>read/write</td><td>A {{RequestPriority}} or `null` ({{ServerContext/serverPriority}})</td></tr>
+    <tr><td>`onpriority`</td><td>read/write</td><td>A function or `null` ({{ServerContext/onpriority}})</td></tr>
+    <tr><td>`autoContinue`</td><td>read-only</td><td>A Boolean ({{ServerContext/autoContinue}})</td></tr>
+    <tr><td>`sendInformational(status, headers)`</td><td>method</td><td>{{ServerContext/sendInformational()}}; returns `undefined`</td></tr>
+    <tr><td>`deny(error)`</td><td>method</td><td>{{ServerContext/deny()}}; returns `undefined`</td></tr>
+    <tr><td>`completed`</td><td>read-only</td><td>A promise or `null`; the same value on every get ({{ServerContext/completed}})</td></tr>
+    <tr><td>`waitUntil(promise)`</td><td>method</td><td>{{ServerContext/waitUntil()}}; returns `undefined`</td></tr>
+  </tbody>
+</table>
 
-  readonly attribute boolean autoContinue;
-  undefined sendInformational([EnforceRange] unsigned short status,
-                              optional ServerHeadersInit headers);
+A <dfn interface>ConnectContext</dfn> is the processing environment for an incoming CONNECT or extended CONNECT request, or an [=upgrade-originated=] request ([[#connectcontext-upgrade]]). It is a {{ServerContext}} that also has the following properties, which add protocol identification and tunnel establishment:
 
-  undefined deny(optional any error);
+<table class="data">
+  <thead><tr><th>Property</th><th>Kind</th><th>Value or behavior</th></tr></thead>
+  <tbody>
+    <tr><td>`connectProtocol`</td><td>read-only</td><td>A String or `null` ({{ConnectContext/connectProtocol}})</td></tr>
+    <tr><td>`accept(init)`</td><td>method</td><td>{{ConnectContext/accept()}}; returns a promise for a {{Tunnel}}</td></tr>
+    <tr><td>`upgradeWebSocket(options)`</td><td>method</td><td>{{ConnectContext/upgradeWebSocket()}}; returns a {{WebSocket}}</td></tr>
+    <tr><td>`upgradeWebSocketStream(options)`</td><td>method</td><td>{{ConnectContext/upgradeWebSocketStream()}}; returns a {{ServerWebSocketStream}}</td></tr>
+    <tr><td>`upgradeWebTransport()`</td><td>method</td><td>{{ConnectContext/upgradeWebTransport()}}; returns a promise for a {{WebTransportSession}}</td></tr>
+  </tbody>
+</table>
 
-  readonly attribute object? completed;
-  undefined waitUntil(Promise&lt;any> promise);
+The contexts that an implementation supplies behave as follows:
+
+*   **Arguments and results.** Each method converts its arguments, and each setter its value, as a Web IDL operation or attribute with the signature below would [[!WEBIDL]], rethrowing any exception; and each method that returns a promise reports an exception as a rejected promise rather than throwing, as a Web IDL operation does. The signatures use Web IDL notation, but they are not Web IDL definitions:
+
+    <pre highlight="webidl">
+    attribute RequestPriority? serverPriority;  // read as a RequestPriority dictionary, or null
+    attribute PriorityCallback? onpriority;
+    undefined sendInformational([EnforceRange] unsigned short status, optional ServerHeadersInit headers);
+    undefined deny(optional any error);
+    undefined waitUntil(Promise&lt;any> promise);
+    Promise&lt;Tunnel> accept(optional ConnectAcceptInit init = {});
+    WebSocket upgradeWebSocket(optional WebSocketUpgradeInit options = {});
+    ServerWebSocketStream upgradeWebSocketStream(optional WebSocketUpgradeInit options = {});
+    Promise&lt;WebTransportSession> upgradeWebTransport();
+    </pre>
+
+    Getters that return a {{SocketAddress}} or {{RequestPriority}} return the dictionary converted to a JavaScript value, which is a new object on every get.
+
+*   **Bound to the exchange.** Each context is created for one [=exchange=], and its methods and accessors act on that context whatever their `this` value is. In the steps that define them, "this context" means the context they belong to, not the `this` value. So a method can be detached from its context, as in `const { waitUntil } = ctx`, and an object that inherits from a context acts on the same exchange as the context:
+
+    ```js
+    // Middleware: present a different request to an inner handler,
+    // while deny(), sendInformational(), and waitUntil() still act
+    // on the real exchange.
+    const inner = Object.create(ctx, { request: { value: rewritten } });
+    return next.fetch(inner);
+    ```
+
+    How this is achieved, for example with functions created lazily for each context, is up to the implementation.
+
+Code that receives a context relies only on these properties, so it can equally be given an object that the application constructs, such as a test double:
+
+```js
+const ctx = {
+  request: makeRequest('GET', 'https://example.com/'),
+  waitUntil(p) { pending.push(p); },
+  deny() { denied = true; },
+  // ...other properties used by the handler under test
 };
-</pre>
+const response = await handler.fetch(ctx);
+```
 
-The {{ServerContext}} interface is the server-side processing environment for an incoming HTTP request. It provides the {{ServerRequest}}, connection metadata, server capabilities, and lifecycle management.
+Such an object is not backed by an [=exchange=]: its methods do whatever the application defines, and nothing in this specification constrains them. An implementation never receives a context back from application code, so it does not need to tell its own contexts from others.
 
-Web IDL does not allow dictionary-typed attributes, so the attributes that carry a {{SocketAddress}} ({{ServerContext/remoteAddress}}, {{ServerContext/localAddress}}, and {{Listener/address}}) or a {{RequestPriority}} ({{ServerContext/clientPriority}} and {{ServerContext/serverPriority}}) are typed `object`. Each of these getters returns the dictionary converted to a JavaScript value [[!WEBIDL]], which is a new object on every get. The {{ServerContext/serverPriority}} setter converts a non-null value to a {{RequestPriority}}, rethrowing any exception, so `ctx.serverPriority = { urgency: 1 }` works as for a dictionary, and then throws a {{RangeError}} if the resulting {{RequestPriority/urgency}} is greater than 7 ([[#priority-server]]). Because {{ServerRequest}} and {{ServerHeaders}} are object protocols rather than Web IDL interfaces ([[#idl-serverrequest]], [[#idl-serverheaders]]), the attributes that return them, {{ServerContext/request}}, {{ServerResponse/headers}}, and {{ServerResponse/trailers}}, are typed `object` (or a promise for one); their values are a {{ServerRequest}}, a {{ServerHeaders}} object, and a promise for one. Likewise, {{ServerContext/completed}} is typed `object?` because Web IDL does not allow nullable promise types: its value is a promise or `null` ([[#servercontext-lifecycle]]).
-
-The ConnectContext interface {#idl-connectcontext}
---------------------------------------------------
-
-<pre class="idl">
-[Exposed=*]
-interface ConnectContext : ServerContext {
-  readonly attribute DOMString? connectProtocol;
-
-  Promise&lt;Tunnel> accept(optional ConnectAcceptInit init = {});
-
-  WebSocket upgradeWebSocket(optional WebSocketUpgradeInit options = {});
-  ServerWebSocketStream upgradeWebSocketStream(optional WebSocketUpgradeInit options = {});
-  Promise&lt;WebTransportSession> upgradeWebTransport();
-};
-</pre>
-
-The {{ConnectContext}} interface is the server-side processing environment for an incoming CONNECT or extended CONNECT request. It extends {{ServerContext}} with protocol identification and tunnel establishment capabilities.
+Note: Where a Web IDL definition in this specification returns an object defined by a protocol or a dictionary, the type is `object`, because Web IDL has no type for the former and does not allow dictionary-typed attributes. This applies to {{Listener/address}}, which returns a {{SocketAddress}} converted to a JavaScript value (a new object on every get), and to {{ServerResponse/headers}} and {{ServerResponse/trailers}}, which return a {{ServerHeaders}} object and a promise for one. The context argument of the handler callbacks is typed `object` for the same reason ([[#idl-callbacks]]).
 
 The Tunnel interface {#idl-tunnel}
 ----------------------------------
@@ -3266,15 +3302,15 @@ This specification defines the server-side half of typed error signaling: the [=
 
 The client-side half remains open. When a `fetch()` call observes a stream reset, the Fetch Standard currently collapses it into a bare {{TypeError}}. Surfacing the same [=error codes=] there &mdash; on the rejection, and on errors of the response body stream &mdash; requires changes to the Fetch Standard's network error concept, and benefits from the [TC39 Error Code proposal](https://github.com/tc39/proposal-error-code-property) for a standardized `code` constructor option. The registry in [[#errors-codes]] is designed to be shared by both sides.
 
-Constructing request contexts {#open-context-construction}
-----------------------------------------------------------
+Constructing request objects {#open-context-construction}
+--------------------------------------------------------
 
-There is no way for application code to construct a {{ServerRequest}} or a {{ServerContext}}. Two use cases need one:
+Because {{ServerContext}}, {{ConnectContext}}, and {{ServerRequest}} are object protocols with methods bound to their exchange ([[#idl-servercontext]]), middleware can present a rewritten request to an inner handler by deriving an object from its context, and a test can call a handler with a context that it constructs itself. Two gaps remain:
 
-*   **Delegation with rewriting.** Middleware that delegates to an inner handler passes along its own context ([[#serverresponse-body]]), so it cannot change what the inner handler sees: the request's URL (for example, to strip a mount prefix) or its header fields (for example, to add an authenticated identity). The header fields of {{ServerContext/request}} are immutable by design.
-*   **Testing.** A handler cannot be invoked without a server, so unit tests depend on implementation-specific helpers.
+*   **Constructing a request.** A {{ServerRequest}} built by application code must implement the protocol by hand, including body iteration, {{ServerRequest/signal}}, and {{ServerRequest/trailers}}, and a {{ServerHeaders}} object likewise. A standard factory, for example one that creates a {{ServerRequest}} from a URL, a method, header fields, and a body, would make rewriting and testing simpler and consistent.
+*   **Rewritten requests and the real exchange.** When middleware substitutes a request, the implementation's behavior still follows the real request: for example, the automatic `100 (Continue)` response is triggered by reading the real body ([[#servercontext-100-continue]]), and a CONNECT request's content is unavailable whatever the substitute says. A factory that derives a request from the real one could keep these connections intact.
 
-A possible design is a method that derives a context from an existing one, sharing its [=exchange=] state (so that {{ServerContext/deny()}}, {{ServerContext/sendInformational()}}, and the upgrade methods act on the real exchange) but presenting a different request, together with a way to construct a request from a URL, method, header fields, and body. Construction for testing would also need a context that is not backed by a network exchange, whose observable effects (responses, denials, informational responses) a test can inspect.
+A test context that records the observable effects of a handler (responses, denials, informational responses, upgrades) without a network exchange could also be standardized, so that tests do not each define their own.
 
 WebTransport server profile {#open-webtransport-profile}
 -------------------------------------------------------
